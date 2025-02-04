@@ -1,0 +1,176 @@
+import numpy as np
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from memory_profiler import memory_usage
+
+
+# ====================================================================================================
+# MAIN FUNCTION STARTS HERE ==========================================================================
+
+@dataclass
+class VideoInfos:
+    root_dir: Path
+    train_videos: list[Path]
+    validation_videos: list[Path]
+    test_videos: list[Path]
+
+
+hyfluid_video_infos = VideoInfos(
+    root_dir=Path("../../data/hyfluid"),
+    train_videos=[Path("train00.mp4"), Path("train01.mp4"), Path("train02.mp4"), Path("train03.mp4")],
+    validation_videos=[],
+    test_videos=[Path("train04.mp4")],
+)
+
+
+@dataclass
+class CameraInfos:
+    transform_matrices: list[np.ndarray]
+    camera_angle_x: list[float]
+    near: list[float]
+    far: list[float]
+
+
+hyfluid_camera_infos_list = [
+    CameraInfos(
+        transform_matrices=[np.array([[0.48627835512161255, -0.24310240149497986, -0.8393059968948364, -0.7697111964225769],
+                                      [-0.01889985240995884, 0.9573688507080078, -0.2882491946220398, 0.013170702382922173],
+                                      [0.8735995292663574, 0.15603208541870117, 0.4609531760215759, 0.3249526023864746],
+                                      [0.0, 0.0, 0.0, 1.0]])],
+        camera_angle_x=[0.40746459248665245],
+        near=[1.1],
+        far=[1.5],
+    ),  # train00.mp4
+    CameraInfos(
+        transform_matrices=[np.array([[0.8157652020454407, -0.1372431218624115, -0.5618642568588257, -0.39192497730255127],
+                                      [-0.04113851860165596, 0.9552109837532043, -0.2930521070957184, 0.010452679358422756],
+                                      [0.5769183039665222, 0.262175977230072, 0.7735819220542908, 0.8086869120597839],
+                                      [0.0, 0.0, 0.0, 1.0]])],
+        camera_angle_x=[0.39413608028840563],
+        near=[1.1],
+        far=[1.5],
+    ),  # train01.mp4
+    CameraInfos(
+        transform_matrices=[np.array([[0.999511182308197, -0.0030406631994992495, -0.03111351653933525, 0.2844361364841461],
+                                      [-0.005995774641633034, 0.9581364989280701, -0.2862490713596344, 0.011681094765663147],
+                                      [0.03068138100206852, 0.28629571199417114, 0.9576499462127686, 0.9857829809188843],
+                                      [0.0, 0.0, 0.0, 1.0]])],
+        camera_angle_x=[0.41505697544547304],
+        near=[1.1],
+        far=[1.5],
+    ),  # train02.mp4
+    CameraInfos(
+        transform_matrices=[np.array([[0.8836436867713928, 0.15215487778186798, 0.44274458289146423, 0.8974969983100891],
+                                      [-0.021659603342413902, 0.9579861760139465, -0.28599533438682556, 0.02680988796055317],
+                                      [-0.46765878796577454, 0.24312829971313477, 0.8498140573501587, 0.8316138386726379],
+                                      [0.0, 0.0, 0.0, 1.0]])],
+        camera_angle_x=[0.41320072172607875],
+        near=[1.1],
+        far=[1.5],
+    ),  # train03.mp4
+    CameraInfos(
+        transform_matrices=[np.array([[0.6336104273796082, 0.20118704438209534, 0.7470352053642273, 1.2956339120864868],
+                                      [0.014488859102129936, 0.9623404741287231, -0.27146074175834656, 0.02436656318604946],
+                                      [-0.7735165357589722, 0.1828240603208542, 0.6068339943885803, 0.497546911239624],
+                                      [0.0, 0.0, 0.0, 1.0]])],
+        camera_angle_x=[0.40746459248665245],
+        near=[1.1],
+        far=[1.5],
+    ),  # train04.mp4
+]
+
+
+def load_videos_data_high_memory(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+    """
+    load videos data, for small dataset. (high memory consumption, but faster)
+
+    Args:
+    - infos: VideoInfos
+
+    Returns:
+    - np.ndarray of shape (#videos, #frames, H, W, C)
+
+    """
+    import imageio.v3 as imageio
+
+    video_paths = {
+        "train": infos.train_videos,
+        "validation": infos.validation_videos,
+        "test": infos.test_videos
+    }.get(dataset_type)
+
+    ##### validation layer start #####
+    if video_paths is None: raise ValueError(f"Invalid dataset_type: {dataset_type}, expected one of ['train', 'validation', 'test']")
+    if not video_paths: raise ValueError(f"No video paths found for dataset_type: {dataset_type}")
+    ##### validation layer end #####
+
+    _frames_arrays = []
+    for video_path in video_paths:
+        _path = infos.root_dir / video_path
+        try:
+            _frames = imageio.imread(_path, plugin="pyav")
+            _frames_arrays.append(_frames)
+        except Exception as e:
+            print(f"Error loading video: {e}")
+
+    return np.array(_frames_arrays)
+
+
+def load_videos_data_low_memory(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+    """
+    load videos data, for large dataset. (low memory consumption, but much slower)
+
+    Args:
+    - infos: VideoInfos
+
+    Returns:
+    - np.ndarray of shape (#videos, #frames, H, W, C)
+
+    """
+    import imageio.v2 as imageio
+
+    video_paths = {
+        "train": infos.train_videos,
+        "validation": infos.validation_videos,
+        "test": infos.test_videos
+    }.get(dataset_type)
+
+    ##### validation layer start #####
+    if video_paths is None: raise ValueError(f"Invalid dataset_type: {dataset_type}, expected one of ['train', 'validation', 'test']")
+    if not video_paths: raise ValueError(f"No video paths found for dataset_type: {dataset_type}")
+    ##### validation layer end #####
+
+    _frames_arrays = []
+    for video_path in video_paths:
+        _path = infos.root_dir / video_path
+        try:
+            _reader = imageio.get_reader(_path)
+            _frames = [frame for frame in _reader]
+            _frames_arrays.append(_frames)
+        except Exception as e:
+            print(f"Error loading video: {e}")
+
+    return np.array(_frames_arrays)
+
+
+# MAIN FUNCTION ENDS HERE ============================================================================
+# ====================================================================================================
+
+
+# ====================================================================================================
+# UNIT TESTS START HERE ==============================================================================
+
+if __name__ == "__main__":
+    print("========== Unit tests start ==========")
+
+    video_infos = hyfluid_video_infos
+    print(f"load_videos_data_high_memory, train: {memory_usage((load_videos_data_high_memory, (video_infos, 'train')))}")
+    print(f"load_videos_data_high_memory, test: {memory_usage((load_videos_data_high_memory, (video_infos, 'test')))}")
+    print(f"load_videos_data_low_memory, train: {memory_usage((load_videos_data_low_memory, (video_infos, 'train')))}")
+    print(f"load_videos_data_low_memory, test: {memory_usage((load_videos_data_low_memory, (video_infos, 'test')))}")
+
+    print("========== Unit tests passed ==========")
+
+# UNIT TESTS END HERE ================================================================================
+# ====================================================================================================
