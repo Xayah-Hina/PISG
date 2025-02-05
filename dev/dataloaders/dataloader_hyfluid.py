@@ -1,3 +1,5 @@
+import torch
+import torchvision.io as io
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,7 +83,7 @@ hyfluid_camera_infos_list = [
 ]
 
 
-def load_videos_data_high_memory(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+def load_videos_data_high_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
     """
     load videos data, for small dataset. (high memory consumption, but faster)
 
@@ -117,7 +119,7 @@ def load_videos_data_high_memory(infos: VideoInfos, dataset_type: Literal["train
     return np.array(_frames_arrays)
 
 
-def load_videos_data_low_memory(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+def load_videos_data_low_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
     """
     load videos data, for large dataset. (low memory consumption, but much slower)
 
@@ -154,6 +156,34 @@ def load_videos_data_low_memory(infos: VideoInfos, dataset_type: Literal["train"
     return np.array(_frames_arrays)
 
 
+def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], device) -> torch.Tensor:
+    video_paths = {
+        "train": infos.train_videos,
+        "validation": infos.validation_videos,
+        "test": infos.test_videos
+    }.get(dataset_type)
+
+    ##### validation layer start #####
+    if video_paths is None:
+        raise ValueError(f"Invalid dataset_type: {dataset_type}, expected one of ['train', 'validation', 'test']")
+    if not video_paths:
+        raise ValueError(f"No video paths found for dataset_type: {dataset_type}")
+    ##### validation layer end #####
+
+    _frames_tensors = []
+    for video_path in video_paths:
+        _path = str(infos.root_dir / video_path)  # 转换为字符串路径
+        try:
+            # 使用 torchvision 直接读取视频（T, H, W, C）
+            _frames, _, _ = io.read_video(_path, pts_unit="sec")
+            _frames = _frames.to(device, dtype=torch.float32) / 255.0  # 归一化到 [0,1]
+            _frames_tensors.append(_frames)
+        except Exception as e:
+            print(f"Error loading video: {e}")
+
+    return torch.stack(_frames_tensors)  # 变成 (V, T, H, W, C)
+
+
 # MAIN FUNCTION ENDS HERE ============================================================================
 # ====================================================================================================
 
@@ -161,16 +191,52 @@ def load_videos_data_low_memory(infos: VideoInfos, dataset_type: Literal["train"
 # ====================================================================================================
 # UNIT TESTS START HERE ==============================================================================
 
-if __name__ == "__main__":
-    print("========== Unit tests start ==========")
+
+def profile_memories():
+    print("========== Memory Unit tests start ==========")
 
     video_infos = hyfluid_video_infos
-    print(f"load_videos_data_high_memory, train: {memory_usage((load_videos_data_high_memory, (video_infos, 'train')))}")
-    print(f"load_videos_data_high_memory, test: {memory_usage((load_videos_data_high_memory, (video_infos, 'test')))}")
-    print(f"load_videos_data_low_memory, train: {memory_usage((load_videos_data_low_memory, (video_infos, 'train')))}")
-    print(f"load_videos_data_low_memory, test: {memory_usage((load_videos_data_low_memory, (video_infos, 'test')))}")
+    print(f"load_videos_data_high_memory, train: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'train')))}")
+    print(f"load_videos_data_high_memory, test: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'test')))}")
+    print(f"load_videos_data_low_memory, train: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'train')))}")
+    print(f"load_videos_data_low_memory, test: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'test')))}")
 
-    print("========== Unit tests passed ==========")
+    torch.cuda.empty_cache()
+
+    initial_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 初始 GPU 内存 (MB)
+    load_videos_data_device(video_infos, "train", device=torch.device("cuda"))
+    final_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 运行后 GPU 内存 (MB)
+    print(f"load_videos_data_device 增加的 GPU 显存: {final_gpu_memory - initial_gpu_memory:.2f} MB")
+
+    print("========== Memory Unit tests passed ==========")
+
+
+def profile_times():
+    print("========== Time Unit tests start ==========")
+    import time
+
+    video_infos = hyfluid_video_infos
+
+    def time_function(name, func, *args, **kwargs):
+        start = time.time()
+        func(*args, **kwargs)
+        end = time.time()
+        t = end - start
+        print(f"{name}: {t:.4f} seconds")
+
+    time_function("high_mem_train", load_videos_data_high_memory_numpy, video_infos, "train")
+    time_function("high_mem_test", load_videos_data_high_memory_numpy, video_infos, "test")
+    time_function("low_mem_train", load_videos_data_low_memory_numpy, video_infos, "train")
+    time_function("low_mem_test", load_videos_data_low_memory_numpy, video_infos, "test")
+    time_function("device_train", load_videos_data_device, video_infos, "train", device=torch.device("cuda"))
+    time_function("device_test", load_videos_data_device, video_infos, "test", device=torch.device("cuda"))
+
+    print("========== Time Unit tests passed ==========")
+
+
+if __name__ == "__main__":
+    profile_memories()
+    profile_times()
 
 # UNIT TESTS END HERE ================================================================================
 # ====================================================================================================
