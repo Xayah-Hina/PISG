@@ -176,6 +176,7 @@ def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "v
         try:
             # 使用 torchvision 直接读取视频（T, H, W, C）
             _frames, _, _ = io.read_video(_path, pts_unit="sec")
+            print(f"Video shape: {_frames.shape}")
             _frames = _frames.to(device, dtype=dtype) / 255.0  # 归一化到 [0,1]
             _frames_tensors.append(_frames)
         except Exception as e:

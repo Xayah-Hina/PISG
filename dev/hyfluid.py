@@ -30,10 +30,12 @@ class HyFluidPipeline:
 
         # 3. pre-sample rays
         focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
-        rays_origin_device, rays_direction_device, u_device, v_device = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=True)
+        rays_origin_device, rays_direction_device, u_device, v_device = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (#cameras, H, W, 3), (H, W), (H, W)
 
         # 4. resample images
         train_video_resampled_device = resample_images_torch(train_video_data_device, u_device, v_device)  # (#videos, #frames, H, W, C)
+
+        # 5. load model and encoder
 
 
 if __name__ == '__main__':
