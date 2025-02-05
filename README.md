@@ -6,8 +6,11 @@
   - Python 3.11
   - torch 2.6.0 + cu124
   - numpy 2.1.2
+  - scipy 1.15.1
 - load dataset only
   - imageio 2.37.0
   - av 14.1.0
 - unit tests only
   - memory_profiler 0.61.0
+- for hyfluid only
+  - taichi 1.7.3
