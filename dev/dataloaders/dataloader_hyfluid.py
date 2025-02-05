@@ -1,8 +1,7 @@
-import os.path
-
 import torch
 import torchvision.io as io
 import numpy as np
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
