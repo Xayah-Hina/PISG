@@ -83,7 +83,7 @@ hyfluid_camera_infos_list = [
 ]
 
 
-def load_videos_data_high_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+def load_videos_data_high_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], dtype) -> np.ndarray:
     """
     load videos data, for small dataset. (high memory consumption, but faster)
 
@@ -116,10 +116,10 @@ def load_videos_data_high_memory_numpy(infos: VideoInfos, dataset_type: Literal[
         except Exception as e:
             print(f"Error loading video: {e}")
 
-    return np.array(_frames_arrays)
+    return np.array(_frames_arrays).astype(dtype) / 255.0
 
 
-def load_videos_data_low_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"]) -> np.ndarray:
+def load_videos_data_low_memory_numpy(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], dtype) -> np.ndarray:
     """
     load videos data, for large dataset. (low memory consumption, but much slower)
 
@@ -153,10 +153,10 @@ def load_videos_data_low_memory_numpy(infos: VideoInfos, dataset_type: Literal["
         except Exception as e:
             print(f"Error loading video: {e}")
 
-    return np.array(_frames_arrays)
+    return np.array(_frames_arrays).astype(dtype) / 255.0
 
 
-def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], device) -> torch.Tensor:
+def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], device, dtype) -> torch.Tensor:
     video_paths = {
         "train": infos.train_videos,
         "validation": infos.validation_videos,
@@ -176,7 +176,7 @@ def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "v
         try:
             # 使用 torchvision 直接读取视频（T, H, W, C）
             _frames, _, _ = io.read_video(_path, pts_unit="sec")
-            _frames = _frames.to(device, dtype=torch.float32) / 255.0  # 归一化到 [0,1]
+            _frames = _frames.to(device, dtype=dtype) / 255.0  # 归一化到 [0,1]
             _frames_tensors.append(_frames)
         except Exception as e:
             print(f"Error loading video: {e}")
@@ -204,7 +204,7 @@ def profile_memories():
     torch.cuda.empty_cache()
 
     initial_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 初始 GPU 内存 (MB)
-    load_videos_data_device(video_infos, "train", device=torch.device("cuda"))
+    ret = load_videos_data_device(video_infos, "train", device=torch.device("cuda"))
     final_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 运行后 GPU 内存 (MB)
     print(f"load_videos_data_device 增加的 GPU 显存: {final_gpu_memory - initial_gpu_memory:.2f} MB")
 
