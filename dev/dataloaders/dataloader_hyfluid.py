@@ -196,15 +196,15 @@ def profile_memories():
     print("========== Memory Unit tests start ==========")
 
     video_infos = hyfluid_video_infos
-    print(f"load_videos_data_high_memory, train: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'train')))}")
-    print(f"load_videos_data_high_memory, test: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'test')))}")
-    print(f"load_videos_data_low_memory, train: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'train')))}")
-    print(f"load_videos_data_low_memory, test: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'test')))}")
+    print(f"load_videos_data_high_memory, train: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'train', np.float32)))}")
+    print(f"load_videos_data_high_memory, test: {memory_usage((load_videos_data_high_memory_numpy, (video_infos, 'test', np.float32)))}")
+    print(f"load_videos_data_low_memory, train: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'train', np.float32)))}")
+    print(f"load_videos_data_low_memory, test: {memory_usage((load_videos_data_low_memory_numpy, (video_infos, 'test', np.float32)))}")
 
     torch.cuda.empty_cache()
 
     initial_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 初始 GPU 内存 (MB)
-    ret = load_videos_data_device(video_infos, "train", device=torch.device("cuda"))
+    ret = load_videos_data_device(video_infos, "train", device=torch.device("cuda"), dtype=torch.float16)
     final_gpu_memory = torch.cuda.memory_allocated() / (1024 ** 2)  # 运行后 GPU 内存 (MB)
     print(f"load_videos_data_device 增加的 GPU 显存: {final_gpu_memory - initial_gpu_memory:.2f} MB")
 
@@ -224,23 +224,19 @@ def profile_times():
         t = end - start
         print(f"{name}: {t:.4f} seconds")
 
-    time_function("high_mem_train", load_videos_data_high_memory_numpy, video_infos, "train")
-    time_function("high_mem_test", load_videos_data_high_memory_numpy, video_infos, "test")
-    time_function("low_mem_train", load_videos_data_low_memory_numpy, video_infos, "train")
-    time_function("low_mem_test", load_videos_data_low_memory_numpy, video_infos, "test")
-    time_function("device_train", load_videos_data_device, video_infos, "train", device=torch.device("cuda"))
-    time_function("device_test", load_videos_data_device, video_infos, "test", device=torch.device("cuda"))
+    time_function("high_mem_train", load_videos_data_high_memory_numpy, video_infos, "train", np.float32)
+    time_function("high_mem_test", load_videos_data_high_memory_numpy, video_infos, "test", np.float32)
+    time_function("low_mem_train", load_videos_data_low_memory_numpy, video_infos, "train", np.float32)
+    time_function("low_mem_test", load_videos_data_low_memory_numpy, video_infos, "test", np.float32)
+    time_function("device_train", load_videos_data_device, video_infos, "train", device=torch.device("cuda"), dtype=torch.float16)
+    time_function("device_test", load_videos_data_device, video_infos, "test", device=torch.device("cuda"), dtype=torch.float16)
 
     print("========== Time Unit tests passed ==========")
 
 
 if __name__ == "__main__":
-    # profile_memories()
-    # profile_times()
-
-    ret1 = load_videos_data_high_memory_numpy(hyfluid_video_infos, "train")
-    ret2 = load_videos_data_device(hyfluid_video_infos, "train", device=torch.device("cuda"))
-    print(np.allclose(ret1, ret2.cpu().numpy(), atol=1e-2, rtol=1e-2))
+    profile_memories()
+    profile_times()
 
 # UNIT TESTS END HERE ================================================================================
 # ====================================================================================================
