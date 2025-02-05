@@ -12,5 +12,6 @@
   - av 14.1.0
 - unit tests only
   - memory_profiler 0.61.0
+  - matplotlib 3.10.0
 - for hyfluid only
   - taichi 1.7.3
