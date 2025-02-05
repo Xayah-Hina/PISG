@@ -173,10 +173,11 @@ def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "v
     _frames_tensors = []
     for video_path in video_paths:
         _path = str(infos.root_dir / video_path)  # 转换为字符串路径
+        if not Path(_path).exists():
+            raise FileNotFoundError(f"Video file not found: {_path}")
         try:
             # 使用 torchvision 直接读取视频（T, H, W, C）
             _frames, _, _ = io.read_video(_path, pts_unit="sec")
-            print(f"Video shape: {_frames.shape}")
             _frames = _frames.to(device, dtype=dtype) / 255.0  # 归一化到 [0,1]
             _frames_tensors.append(_frames)
         except Exception as e:
