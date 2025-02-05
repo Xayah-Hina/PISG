@@ -235,8 +235,12 @@ def profile_times():
 
 
 if __name__ == "__main__":
-    profile_memories()
-    profile_times()
+    # profile_memories()
+    # profile_times()
+
+    ret1 = load_videos_data_high_memory_numpy(hyfluid_video_infos, "train")
+    ret2 = load_videos_data_device(hyfluid_video_infos, "train", device=torch.device("cuda"))
+    print(np.allclose(ret1, ret2.cpu().numpy(), atol=1e-2, rtol=1e-2))
 
 # UNIT TESTS END HERE ================================================================================
 # ====================================================================================================
