@@ -1,3 +1,5 @@
+import os.path
+
 import torch
 import torchvision.io as io
 import numpy as np
@@ -157,6 +159,19 @@ def load_videos_data_low_memory_numpy(infos: VideoInfos, dataset_type: Literal["
 
 
 def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "validation", "test"], device, dtype) -> torch.Tensor:
+    """
+    load videos data purely on device
+
+    Args:
+    - infos: VideoInfos
+    - dataset_type: Literal["train", "validation", "test"]
+    - device: torch.device
+    - dtype: torch.dtype
+
+    Returns:
+    - torch.Tensor of shape (#videos, #frames, H, W, C)
+
+    """
     video_paths = {
         "train": infos.train_videos,
         "validation": infos.validation_videos,
@@ -168,22 +183,43 @@ def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "v
         raise ValueError(f"Invalid dataset_type: {dataset_type}, expected one of ['train', 'validation', 'test']")
     if not video_paths:
         raise ValueError(f"No video paths found for dataset_type: {dataset_type}")
+    for video_path in video_paths:
+        _path = os.path.normpath(infos.root_dir / video_path)
+        if not Path(_path).exists():
+            raise FileNotFoundError(f"Video file not found: {_path}")
     ##### validation layer end #####
 
     _frames_tensors = []
     for video_path in video_paths:
-        _path = str(infos.root_dir / video_path)  # 转换为字符串路径
-        if not Path(_path).exists():
-            raise FileNotFoundError(f"Video file not found: {_path}")
+        _path = os.path.normpath(infos.root_dir / video_path)
         try:
-            # 使用 torchvision 直接读取视频（T, H, W, C）
             _frames, _, _ = io.read_video(_path, pts_unit="sec")
-            _frames = _frames.to(device, dtype=dtype) / 255.0  # 归一化到 [0,1]
+            _frames = _frames.to(device, dtype=dtype) / 255.0  # normalize to [0, 1]
             _frames_tensors.append(_frames)
         except Exception as e:
             print(f"Error loading video: {e}")
 
-    return torch.stack(_frames_tensors)  # 变成 (V, T, H, W, C)
+    return torch.stack(_frames_tensors)  # (V, T, H, W, C)
+
+
+def resample_images_by_ratio_device(images: torch.Tensor, ratio: float) -> torch.Tensor:
+    """
+    resample images by ratio
+
+    Args:
+    - images: torch.Tensor of shape (V, T, H, W, C)
+    - ratio: float, resampling ratio
+
+    Returns:
+    - torch.Tensor of shape (V, T, H * ratio, W * ratio, C)
+
+    """
+    V, T, H, W, C = images.shape
+    images_permuted = images.permute(0, 1, 4, 2, 3).reshape(V * T, C, H, W)  # (V * T, C, H, W)
+    images_permuted_resized = (torch.nn.functional.interpolate(images_permuted, size=(int(H * ratio), int(W * ratio)), mode='bilinear', align_corners=False)
+                               .reshape(V, T, C, int(H * ratio), int(W * ratio))
+                               .permute(0, 1, 3, 4, 2))  # (V, T, H * ratio, W * ratio, C)
+    return images_permuted_resized
 
 
 # MAIN FUNCTION ENDS HERE ============================================================================
