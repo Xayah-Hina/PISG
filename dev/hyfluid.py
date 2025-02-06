@@ -102,8 +102,32 @@ class HyFluidPipeline:
             if _ % 100 == 0:
                 tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
 
+        torch.save({
+            'encoder_state_dict': encoder_device.state_dict(),
+            'model_state_dict': model_device.state_dict(),
+        }, "final_ckp.tar")
+
+    def test_density_device(self):
+        """
+        Test the model totally on the device
+        """
+        # 0. constants
+
+        # 1. load encoder, model, optimizer
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=encoder_device.num_levels * 2).to(self.device)
+        ckpt = torch.load("final_ckp.tar")
+        encoder_device.load_state_dict(ckpt['encoder_state_dict'])
+        model_device.load_state_dict(ckpt['model_state_dict'])
+
+        # 2. load poses
+        train_indices = [4]
+        train_poses_device = torch.tensor([self.camera_infos[i].transform_matrices for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras, 4, 4)
+        width = 1080 * args.ratio
+        focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
+
 
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
-    hyfluid.train_density_device()
+    hyfluid.test_density_device()
