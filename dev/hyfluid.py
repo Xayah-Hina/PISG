@@ -1,5 +1,5 @@
 from dataloaders.dataloader_hyfluid import VideoInfos, CameraInfos, hyfluid_video_infos, hyfluid_camera_infos_list, load_videos_data_device, resample_images_by_ratio_device
-from utils.utils_nerf import generate_rays_device, resample_images_torch
+from utils.utils_nerf import generate_rays_device, resample_images_torch, get_points_device
 from model.model_hyfluid import NeRFSmall
 from model.encoder_hyfluid import HashEncoderNative
 import torch
@@ -61,6 +61,7 @@ class HyFluidPipeline:
         for _ in tqdm.trange(0, args.total_iters):
             # resample rays
             if rays_iter >= N_rays:
+                tqdm.tqdm.write(f"Resampling rays...")
                 _rays_origin_device, _rays_direction_device, _u_device, _v_device = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (H, W)
                 rays_origin_flatten_device, rays_direction_flatten_device = _rays_origin_device.reshape(-1, 3), _rays_direction_device.reshape(-1, 3)  # (#cameras * H * W, 3), (#cameras * H * W, 3)
                 rays_random_idxs_device = torch.randperm(N_rays, device=self.device, dtype=torch.int32)  # (#cameras * H * W)
@@ -79,6 +80,9 @@ class HyFluidPipeline:
             batch_ray_origins = rays_origin_flatten_device[pixels_idxs]
             batch_ray_directions = rays_direction_flatten_device[pixels_idxs]
             batch_target_pixels = target_frame_device[pixels_idxs]
+            batch_points, batch_depths = get_points_device(batch_ray_origins, batch_ray_directions, args.near, args.far, args.depth, randomize=True)
+            batch_time = torch.tensor(frame / (N_frames - 1), device=self.device, dtype=self.dtype_device)
+            input_xyzt = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)
 
             optimizer.zero_grad()
 
