@@ -1,7 +1,7 @@
 from dataloaders.dataloader_hyfluid import VideoInfos, CameraInfos, hyfluid_video_infos, hyfluid_camera_infos_list, load_videos_data_device, resample_images_by_ratio_device
 from utils.utils_nerf import generate_rays_device, resample_images_torch, get_points_device
 from model.model_hyfluid import NeRFSmall
-from model.encoder_hyfluid import HashEncoderNative3
+from model.encoder_hyfluid import HashEncoderNative
 import torch
 import numpy as np
 import tqdm
@@ -41,7 +41,7 @@ class HyFluidPipeline:
         # 0. constants
 
         # 1. load encoder, model, optimizer
-        encoder_device = HashEncoderNative3(device=self.device).to(self.device)
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
 
@@ -124,7 +124,7 @@ class HyFluidPipeline:
         import imageio.v2 as imageio
 
         # 1. load encoder, model, optimizer
-        encoder_device = HashEncoderNative3(device=self.device).to(self.device)
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         ckpt = torch.load("final_ckp.tar")
         encoder_device.load_state_dict(ckpt['encoder_state_dict'])
@@ -150,12 +150,7 @@ class HyFluidPipeline:
                     test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
-                    chunk = 512 * 64
-                    ret_list = []
-                    for it in range(0, test_input_xyzt_flat.shape[0], chunk):
-                        _ret = model_device(encoder_device(test_input_xyzt_flat[it:min(it + chunk, test_input_xyzt_flat.shape[0])]))
-                        ret_list.append(_ret)
-                    raw_flat = torch.cat(ret_list, 0)
+                    raw_flat = model_device(encoder_device(test_input_xyzt_flat))
                     raw = raw_flat.reshape(height * width, args.depth, 1)  # (H, W, #depth, 1)
                     rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
                     alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * depths)
