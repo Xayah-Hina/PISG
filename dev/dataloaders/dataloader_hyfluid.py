@@ -201,6 +201,30 @@ def load_videos_data_device(infos: VideoInfos, dataset_type: Literal["train", "v
     return torch.stack(_frames_tensors)  # (V, T, H, W, C)
 
 
+def resample_images_by_ratio_numpy(images: np.ndarray, ratio: float) -> np.ndarray:
+    """
+    Resample images by ratio using NumPy and OpenCV.
+
+    Args:
+    - images: np.ndarray of shape (V, T, H, W, C)
+    - ratio: float, resampling ratio
+
+    Returns:
+    - np.ndarray of shape (V, T, H * ratio, W * ratio, C)
+    """
+    import cv2
+    V, T, H, W, C = images.shape
+    H_new, W_new = int(H * ratio), int(W * ratio)
+
+    resampled_images = np.empty((V, T, H_new, W_new, C), dtype=images.dtype)
+
+    for v in range(V):
+        for t in range(T):
+            resampled_images[v, t] = cv2.resize(images[v, t], (W_new, H_new), interpolation=cv2.INTER_LINEAR)
+
+    return resampled_images
+
+
 def resample_images_by_ratio_device(images: torch.Tensor, ratio: float) -> torch.Tensor:
     """
     resample images by ratio

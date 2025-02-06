@@ -1,5 +1,20 @@
-from dataloaders.dataloader_hyfluid import VideoInfos, CameraInfos, hyfluid_video_infos, hyfluid_camera_infos_list, load_videos_data_device, resample_images_by_ratio_device
-from utils.utils_nerf import generate_rays_device, resample_images_torch, get_points_device
+from dataloaders.dataloader_hyfluid import (
+    VideoInfos,
+    CameraInfos,
+    hyfluid_video_infos,
+    hyfluid_camera_infos_list,
+    load_videos_data_high_memory_numpy,
+    load_videos_data_device,
+    resample_images_by_ratio_numpy,
+    resample_images_by_ratio_device
+)
+from utils.utils_nerf import (
+    generate_rays_numpy,
+    generate_rays_device,
+    resample_images_scipy,
+    resample_images_torch,
+    get_points_device
+)
 from model.model_hyfluid import NeRFSmall
 from model.encoder_hyfluid import HashEncoderNative
 import torch
@@ -9,6 +24,7 @@ import random
 import os
 
 from dataclasses import dataclass
+from pytorch_memlab import profile_every
 
 
 @dataclass
@@ -26,8 +42,6 @@ class HyFluidArguments:
 
 args = HyFluidArguments()
 
-from pytorch_memlab import profile_every
-
 
 class HyFluidPipeline:
     def __init__(self, video_infos: VideoInfos, camera_infos: list[CameraInfos], device, dtype_numpy, dtype_device):
@@ -36,6 +50,88 @@ class HyFluidPipeline:
         self.device = device
         self.dtype_numpy = dtype_numpy
         self.dtype_device = dtype_device
+
+    def train_density_optimized(self):
+        """
+        Train the model totally on the device
+        """
+        # 0. constants
+
+        # 1. load encoder, model, optimizer
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
+        optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
+
+        # 2. load data to cpu
+        train_video_data_numpy = load_videos_data_high_memory_numpy(self.video_infos, dataset_type="train", dtype=self.dtype_numpy)  # (#videos, #frames, H, W, C)
+        train_video_data_numpy = resample_images_by_ratio_numpy(train_video_data_numpy, ratio=args.ratio)  # (#videos, #frames, H * ratio, W * ratio, C)
+        train_video_data_numpy = train_video_data_numpy.transpose(1, 0, 2, 3, 4)  # (#frames, #videos, H * ratio, W * ratio, C)
+        width, height, N_frames = train_video_data_numpy.shape[3], train_video_data_numpy.shape[2], train_video_data_numpy.shape[0]
+
+        # 3. load poses
+        train_indices = [0, 1, 2, 3]
+        train_poses_numpy = np.array([self.camera_infos[i].transform_matrices for i in train_indices], dtype=self.dtype_numpy)  # (#cameras, 4, 4)
+        focals_numpy = np.array([0.5 * width / np.tan(0.5 * np.array(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], dtype=self.dtype_numpy)  # (#cameras)
+
+        # 4. train
+        N_rays = len(train_indices) * height * width
+        rays_iter = N_rays
+
+        loss_history = []
+        rays_origin_flatten_numpy, rays_direction_flatten_numpy, rays_random_idxs_numpy, train_video_resampled_flatten_numpy = None, None, None, None
+        for _ in tqdm.trange(0, args.total_iters):
+            # resample rays
+            if rays_iter >= N_rays:
+                tqdm.tqdm.write(f"Resampling rays...")
+                _rays_origin_numpy, _rays_direction_numpy, _u_numpy, _v_numpy = generate_rays_numpy(train_poses_numpy, focals=focals_numpy, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (H, W)
+                rays_origin_flatten_numpy, rays_direction_flatten_numpy = _rays_origin_numpy.reshape(-1, 3), _rays_direction_numpy.reshape(-1, 3)  # (#cameras * H * W, 3), (#cameras * H * W, 3)
+                rays_random_idxs_numpy = np.random.permutation(N_rays).astype(np.int32)  # (#cameras * H * W)
+                _train_video_resampled_numpy = resample_images_scipy(train_video_data_numpy, _u_numpy, _v_numpy)  # (#frames, #videos, H, W, C)
+                train_video_resampled_flatten_numpy = _train_video_resampled_numpy.reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
+                rays_iter = 0
+            pixels_idxs = rays_random_idxs_numpy[rays_iter:rays_iter + args.batch_size]
+            rays_iter += args.batch_size
+
+            # get target frame (continuous)
+            frame = random.uniform(0, N_frames - 1)
+            frame_floor, frame_ceil, frames_alpha = int(frame), int(frame) + 1, frame - int(frame)
+            target_frame_numpy = (1 - frames_alpha) * train_video_resampled_flatten_numpy[frame_floor] + frames_alpha * train_video_resampled_flatten_numpy[frame_ceil]  # (#cameras * H * W, 3)
+
+            # get batch data
+            batch_ray_origins = torch.tensor(rays_origin_flatten_numpy[pixels_idxs], device=self.device, dtype=self.dtype_device)  # (#batch, 3)
+            batch_ray_directions = torch.tensor(rays_direction_flatten_numpy[pixels_idxs], device=self.device, dtype=self.dtype_device)  # (#batch, 3)
+            batch_target_pixels = torch.tensor(target_frame_numpy[pixels_idxs], device=self.device, dtype=self.dtype_device)  # (#batch, 3)
+            batch_points, batch_depths = get_points_device(batch_ray_origins, batch_ray_directions, args.near, args.far, args.depth, randomize=True)  # (#batch, #depth, 3), (#batch, #depth)
+            batch_time = torch.tensor(frame / (N_frames - 1), device=self.device, dtype=self.dtype_device)
+            batch_input_xyzt = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)  # (#batch, #depth , 4)
+            batch_input_xyzt_flat = batch_input_xyzt.reshape(-1, 4)  # (#batch * #depth, 4)
+
+            # forward
+            raw_flat = model_device(encoder_device(batch_input_xyzt_flat))  # (#batch * #depth, 1)
+            raw = raw_flat.reshape(-1, args.depth, 1)  # (#batch, #depth, 1)
+            rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+            alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
+            weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+            rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+
+            # optimize loss
+            loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
+            optimizer.zero_grad()
+            loss_image.backward()
+            optimizer.step()
+            if _ % 100 == 0:
+                tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
+                loss_history.append(loss_image.item())
+        loss_array = np.array(loss_history)
+        np.save("training_loss.npy", loss_array)
+
+        torch.save({
+            'encoder_state_dict': encoder_device.state_dict(),
+            'model_state_dict': model_device.state_dict(),
+            'width': width,
+            'height': height,
+            'N_frames': N_frames,
+        }, "final_ckp.tar")
 
     @profile_every()
     def train_density_device(self):
