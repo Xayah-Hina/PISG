@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import tqdm
 import random
+import os
 
 from dataclasses import dataclass
 
@@ -119,6 +120,7 @@ class HyFluidPipeline:
         Test the model totally on the device
         """
         # 0. constants
+        import imageio.v2 as imageio
 
         # 1. load encoder, model, optimizer
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
@@ -126,8 +128,7 @@ class HyFluidPipeline:
         ckpt = torch.load("final_ckp.tar")
         encoder_device.load_state_dict(ckpt['encoder_state_dict'])
         model_device.load_state_dict(ckpt['model_state_dict'])
-        width, height = ckpt['width'], ckpt['height']
-        N_frames = ckpt['N_frames']
+        width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
 
         # 2. load poses
         train_indices = [4]
@@ -136,10 +137,33 @@ class HyFluidPipeline:
         test_timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)
 
         # 3. resample rays
-        rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (H, W)
-        points_device, _ = get_points_device(rays_origin_device, rays_direction_device, args.near, args.far, args.depth, randomize=False)  # (#all, #depth, 3), (#all, #depth)
+        rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
+        rays_origin_device, rays_direction_device = rays_origin_device.reshape(rays_origin_device.shape[0], -1, 3), rays_direction_device.reshape(rays_direction_device.shape[0], -1, 3)  # (#cameras, H * W, 3), (#cameras, H * W, 3)
 
-        print(rays_origin_device.shape, rays_direction_device.shape, points_device.shape)
+        for rays_o, rays_d in zip(rays_origin_device, rays_direction_device):
+            points, depths = get_points_device(rays_o, rays_d, args.near, args.far, args.depth, randomize=False)  # (H * W, #depth, 3), (H * W, #depth)
+            points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
+
+            for _ in tqdm.trange(0, N_frames):
+                test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)
+                test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
+
+                chunk = 512 * 64
+                ret_list = []
+                for it in range(0, test_input_xyzt_flat.shape[0], chunk):
+                    _ret = model_device(encoder_device(test_input_xyzt_flat[it:min(it + chunk, test_input_xyzt_flat.shape[0])]))
+                    ret_list.append(_ret)
+                raw_flat = torch.cat(ret_list, 0)
+                raw = raw_flat.reshape(height * width, args.depth, 1)  # (H, W, #depth, 1)
+                rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+                alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * depths)
+                weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+                rgb_map_flat = torch.sum(weights[..., None] * rgb_trained, -2)  # (H * W, 3)
+                rgb_map = rgb_map_flat.reshape(height, width, 3)  # (H, W, 3)
+
+                to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
+                rgb8 = to8b(rgb_map.cpu().numpy())
+                imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
 
 
 if __name__ == '__main__':
