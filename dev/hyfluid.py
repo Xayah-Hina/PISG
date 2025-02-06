@@ -1,7 +1,7 @@
 from dataloaders.dataloader_hyfluid import VideoInfos, CameraInfos, hyfluid_video_infos, hyfluid_camera_infos_list, load_videos_data_device, resample_images_by_ratio_device
 from utils.utils_nerf import generate_rays_device, resample_images_torch, get_points_device
 from model.model_hyfluid import NeRFSmall
-from model.encoder_hyfluid import HashEncoderNative, HashEncoderHyFluid
+from model.encoder_hyfluid import HashEncoderNative
 import torch
 import numpy as np
 import tqdm
@@ -45,12 +45,7 @@ class HyFluidPipeline:
         # 0. constants
 
         # 1. load encoder, model, optimizer
-        # encoder_device = HashEncoderNative(device=self.device).to(self.device)
-        encoder_device = HashEncoderHyFluid(
-            min_res=np.array([16, 16, 16, 16], dtype=np.int32),
-            max_res=np.array([256, 256, 256, 128], dtype=np.int32),
-            num_scales=args.encoder_num_scale,
-        ).to(self.device)
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
 
@@ -133,12 +128,7 @@ class HyFluidPipeline:
         import imageio.v2 as imageio
 
         # 1. load encoder, model, optimizer
-        # encoder_device = HashEncoderNative(device=self.device).to(self.device)
-        encoder_device = HashEncoderHyFluid(
-            min_res=np.array([16, 16, 16, 16], dtype=np.int32),
-            max_res=np.array([256, 256, 256, 128], dtype=np.int32),
-            num_scales=args.encoder_num_scale,
-        ).to(self.device)
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         ckpt = torch.load("final_ckp.tar")
         encoder_device.load_state_dict(ckpt['encoder_state_dict'])
