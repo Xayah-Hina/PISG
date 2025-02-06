@@ -1,7 +1,7 @@
 from dataloaders.dataloader_hyfluid import VideoInfos, CameraInfos, hyfluid_video_infos, hyfluid_camera_infos_list, load_videos_data_device, resample_images_by_ratio_device
 from utils.utils_nerf import generate_rays_device, resample_images_torch, get_points_device
 from model.model_hyfluid import NeRFSmall
-from model.encoder_hyfluid import HashEncoderNative
+from model.encoder_hyfluid import HashEncoderNative, HashEncoderHyFluid
 import torch
 import numpy as np
 import tqdm
@@ -9,6 +9,7 @@ import random
 import os
 
 from dataclasses import dataclass
+
 
 @dataclass
 class HyFluidArguments:
@@ -18,12 +19,14 @@ class HyFluidArguments:
     near: float = 1.1
     far: float = 1.5
     depth: int = 192
-    ratio = 0.25
+    ratio = 1.0
 
     encoder_num_scale: int = 16
 
 
 args = HyFluidArguments()
+
+from pytorch_memlab import profile_every
 
 
 class HyFluidPipeline:
@@ -34,6 +37,7 @@ class HyFluidPipeline:
         self.dtype_numpy = dtype_numpy
         self.dtype_device = dtype_device
 
+    @profile_every()
     def train_density_device(self):
         """
         Train the model totally on the device
@@ -41,7 +45,12 @@ class HyFluidPipeline:
         # 0. constants
 
         # 1. load encoder, model, optimizer
-        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        # encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        encoder_device = HashEncoderHyFluid(
+            min_res=np.array([16, 16, 16, 16], dtype=np.int32),
+            max_res=np.array([256, 256, 256, 128], dtype=np.int32),
+            num_scales=args.encoder_num_scale,
+        ).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
 
@@ -124,7 +133,12 @@ class HyFluidPipeline:
         import imageio.v2 as imageio
 
         # 1. load encoder, model, optimizer
-        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        # encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        encoder_device = HashEncoderHyFluid(
+            min_res=np.array([16, 16, 16, 16], dtype=np.int32),
+            max_res=np.array([256, 256, 256, 128], dtype=np.int32),
+            num_scales=args.encoder_num_scale,
+        ).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         ckpt = torch.load("final_ckp.tar")
         encoder_device.load_state_dict(ckpt['encoder_state_dict'])
@@ -166,5 +180,5 @@ class HyFluidPipeline:
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
-    # hyfluid.train_density_device()
-    hyfluid.test_density_device()
+    hyfluid.train_density_device()
+    # hyfluid.test_density_device()
