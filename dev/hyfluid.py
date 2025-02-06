@@ -77,17 +77,33 @@ class HyFluidPipeline:
             target_frame_device = (1 - frames_alpha) * train_video_resampled_flatten_device[frame_floor] + frames_alpha * train_video_resampled_flatten_device[frame_ceil]  # (#cameras * H * W, 3)
 
             # get batch data
-            batch_ray_origins = rays_origin_flatten_device[pixels_idxs]
-            batch_ray_directions = rays_direction_flatten_device[pixels_idxs]
-            batch_target_pixels = target_frame_device[pixels_idxs]
-            batch_points, batch_depths = get_points_device(batch_ray_origins, batch_ray_directions, args.near, args.far, args.depth, randomize=True)
+            batch_ray_origins = rays_origin_flatten_device[pixels_idxs]  # (#batch, 3)
+            batch_ray_directions = rays_direction_flatten_device[pixels_idxs]  # (#batch, 3)
+            batch_target_pixels = target_frame_device[pixels_idxs]  # (#batch, 3)
+            batch_points, batch_depths = get_points_device(batch_ray_origins, batch_ray_directions, args.near, args.far, args.depth, randomize=True)  # (#batch, #depth, 3), (#batch, #depth)
             batch_time = torch.tensor(frame / (N_frames - 1), device=self.device, dtype=self.dtype_device)
-            input_xyzt = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)
+            batch_input_xyzt = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)  # (#batch, #depth , 4)
+            batch_input_xyzt_flat = batch_input_xyzt.reshape(-1, 4)  # (#batch * #depth, 4)
 
+            # forward
+            raw_flat = model_device(encoder_device(batch_input_xyzt_flat))  # (#batch * #depth, 1)
+            raw = raw_flat.reshape(-1, args.depth, 1)  # (#batch, #depth, 1)
+            rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+            raw2alpha = lambda raw, dists, act_fn=torch.nn.functional.relu: 1. - torch.exp(-act_fn(raw) * dists)
+            alpha = raw2alpha(raw[..., -1], batch_depths)
+            weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+            rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+
+            # optimize loss
+            loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
             optimizer.zero_grad()
+            loss_image.backward()
+            optimizer.step()
+            if _ % 100 == 0:
+                tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
 
 
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
-    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float16)
+    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
     hyfluid.train_density_device()

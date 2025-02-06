@@ -71,23 +71,6 @@ def generate_rays_device(poses: torch.Tensor, focals: torch.Tensor, width: int, 
     return rays_o, rays_d, u, v
 
 
-def get_points_device(rays_o: torch.Tensor, rays_d: torch.Tensor, near: float, far: float, N_depths: int, randomize: bool):
-    # 在 [near, far] 之间等间隔采样
-    depths = torch.linspace(near, far, steps=N_depths, device=rays_o.device).expand(rays_o.shape[0], N_depths)  # (N, N_depths)
-    depths_target = depths.clone()
-
-    # 如果启用随机抖动，增加噪声
-    if randomize:
-        midpoints = (depths[:, :-1] + depths[:, 1:]) / 2.0  # 计算相邻点的中点
-        noise = (torch.rand_like(midpoints) - 0.5) * (far - near) / N_depths  # 在每个区间内随机扰动
-        depths_target[:, :-1] = midpoints + noise  # 只修改前 N-1 个点
-
-    # 计算采样点的位置
-    points = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * depths_target.unsqueeze(-1)  # (N, N_depths, 3)
-
-    return points, depths_target  # 返回采样点和深度值
-
-
 def resample_images_scipy(images: ndarray, u: ndarray, v: ndarray):
     """
     Resample images using bilinear interpolation
@@ -146,3 +129,20 @@ def resample_images_torch(images: torch.Tensor, u: torch.Tensor, v: torch.Tensor
     resampled_images = resampled.permute(0, 2, 3, 1).reshape(orig_shape)
 
     return resampled_images
+
+
+def get_points_device(rays_o: torch.Tensor, rays_d: torch.Tensor, near: float, far: float, N_depths: int, randomize: bool):
+    # 在 [near, far] 之间等间隔采样
+    depths = torch.linspace(near, far, steps=N_depths, device=rays_o.device).expand(rays_o.shape[0], N_depths)  # (N, N_depths)
+    depths_target = depths.clone()
+
+    # 如果启用随机抖动，增加噪声
+    if randomize:
+        midpoints = (depths[:, :-1] + depths[:, 1:]) / 2.0  # 计算相邻点的中点
+        noise = (torch.rand_like(midpoints) - 0.5) * (far - near) / N_depths  # 在每个区间内随机扰动
+        depths_target[:, :-1] = midpoints + noise  # 只修改前 N-1 个点
+
+    # 计算采样点的位置
+    points = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * depths_target.unsqueeze(-1)  # (N, N_depths, 3)
+
+    return points, depths_target  # 返回采样点和深度值
