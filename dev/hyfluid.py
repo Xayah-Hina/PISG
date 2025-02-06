@@ -51,7 +51,7 @@ class HyFluidPipeline:
         self.dtype_numpy = dtype_numpy
         self.dtype_device = dtype_device
 
-    def train_density_optimized(self):
+    def train_density_numpy(self):
         """
         Train the model totally on the device
         """
@@ -71,7 +71,7 @@ class HyFluidPipeline:
         # 3. load poses
         train_indices = [0, 1, 2, 3]
         train_poses_numpy = np.array([self.camera_infos[i].transform_matrices for i in train_indices], dtype=self.dtype_numpy)  # (#cameras, 4, 4)
-        focals_numpy = np.array([0.5 * width / np.tan(0.5 * np.array(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], dtype=self.dtype_numpy)  # (#cameras)
+        focals_numpy = np.array([0.5 * width / np.tan(0.5 * np.array(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_numpy)) for i in train_indices], dtype=self.dtype_numpy)  # (#cameras)
 
         # 4. train
         N_rays = len(train_indices) * height * width
@@ -216,6 +216,9 @@ class HyFluidPipeline:
             'N_frames': N_frames,
         }, "final_ckp.tar")
 
+    def test_density_numpy(self):
+        pass
+
     def test_density_device(self):
         """
         Test the model totally on the device
@@ -266,5 +269,7 @@ class HyFluidPipeline:
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
-    hyfluid.train_density_device()
+    hyfluid.train_density_numpy()
+    # hyfluid.train_density_device()
+    # hyfluid.test_density_numpy()
     # hyfluid.test_density_device()
