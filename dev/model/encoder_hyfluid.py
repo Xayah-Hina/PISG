@@ -439,3 +439,136 @@ class HashEncoderNative(torch.nn.Module):
         encoded_value = features[0]  # [..., num_levels, features_per_level]
 
         return torch.flatten(encoded_value, start_dim=-2, end_dim=-1)  # [..., num_levels * features_per_level]
+
+
+class HashEncoderNative2(torch.nn.Module):
+    def __init__(
+            self,
+            num_levels: int = 16,
+            min_res: int = 16,
+            max_res: int = 256,
+            log2_hashmap_size: int = 19,
+            features_per_level: int = 2,
+            hash_init_scale: float = 0.001,
+            device=torch.device("cuda"),
+    ):
+        super().__init__()
+        self.device = device
+        self.num_levels = num_levels
+        self.min_res = min_res
+        self.max_res = max_res
+        self.features_per_level = features_per_level
+        self.primes = torch.tensor([1, 2654435761, 805459861, 3674653429], device=device)
+        self.hash_table_size = 2 ** log2_hashmap_size
+
+        levels = torch.arange(self.num_levels, device=device)
+        self.growth_factor = np.exp((np.log(self.max_res) - np.log(self.min_res)) / (self.num_levels - 1)) if self.num_levels > 1 else 1
+        self.scalings = torch.floor(min_res * self.growth_factor ** levels)
+        self.hash_offset = levels * self.hash_table_size
+
+        self.hash_table = torch.rand(size=(self.hash_table_size * self.num_levels, self.features_per_level), device=device) * 2 - 1
+        self.hash_table *= 0.001
+        self.hash_table = torch.nn.Parameter(self.hash_table)
+
+    def hash_fn(self, in_tensor):
+        in_tensor = in_tensor * self.primes
+        x = torch.bitwise_xor(in_tensor[..., 0], in_tensor[..., 1])
+        x = torch.bitwise_xor(x, in_tensor[..., 2])
+        x = torch.bitwise_xor(x, in_tensor[..., 3])
+        x %= self.hash_table_size
+        x += self.hash_offset.to(x.device)
+        return x
+
+    def forward(self, xyzt):
+        xyzt = xyzt[..., None, :]
+        scaled = xyzt * self.scalings.view(-1, 1).to(xyzt.device)
+        scaled_c = torch.ceil(scaled).type(torch.int32)
+        scaled_f = torch.floor(scaled).type(torch.int32)
+        offset = scaled - scaled_f
+
+        # 计算 16 个顶点索引
+        hashed = torch.empty((16, *scaled_c.shape[:-1]), dtype=torch.int64, device=xyzt.device)
+        for i in range(16):
+            mask = [(i >> d) & 1 for d in range(4)]
+            vertex = torch.cat([scaled_c[..., d:d + 1] if mask[d] else scaled_f[..., d:d + 1] for d in range(4)], dim=-1)
+            hashed[i] = self.hash_fn(vertex)
+
+        # 获取 hash_table 的值
+        hashed = hashed.view(16, -1)  # 展平成 2D 方便索引
+        features = self.hash_table[hashed].view(16, *scaled_c.shape[:-1], self.features_per_level)  # 直接索引
+
+        # 进行 4D 插值
+        for d in range(4):
+            features = torch.lerp(features[::2], features[1::2], offset[..., d:d + 1])
+
+        return torch.flatten(features, start_dim=-2, end_dim=-1)
+
+
+class HashEncoderNative3(torch.nn.Module):
+    def __init__(
+            self,
+            num_levels: int = 16,
+            min_res: int = 16,
+            max_res: int = 256,
+            log2_hashmap_size: int = 19,
+            features_per_level: int = 2,
+            hash_init_scale: float = 0.001,
+            device=torch.device("cuda"),
+    ):
+        super().__init__()
+        self.device = device
+        self.num_levels = num_levels
+        self.min_res = min_res
+        self.max_res = max_res
+        self.features_per_level = features_per_level
+        self.primes = torch.tensor([1, 2654435761, 805459861, 3674653429], device=device)
+        self.hash_table_size = 2 ** log2_hashmap_size
+
+        levels = torch.arange(self.num_levels, device=device)
+        self.growth_factor = np.exp((np.log(self.max_res) - np.log(self.min_res)) / (self.num_levels - 1)) if self.num_levels > 1 else 1
+        self.scalings = torch.floor(min_res * self.growth_factor ** levels).to(device)
+        self.hash_offset = (levels * self.hash_table_size).to(device)
+
+        self.hash_table = torch.rand(size=(self.hash_table_size * self.num_levels, self.features_per_level), device=device) * 2 - 1
+        self.hash_table *= 0.001
+        self.hash_table = torch.nn.Parameter(self.hash_table)
+
+    def hash_fn(self, in_tensor):
+        in_tensor = in_tensor * self.primes
+        x = torch.bitwise_xor(in_tensor[..., 0], in_tensor[..., 1])
+        x = torch.bitwise_xor(x, in_tensor[..., 2])
+        x = torch.bitwise_xor(x, in_tensor[..., 3])
+        x %= self.hash_table_size
+        x += self.hash_offset
+        return x
+
+    def forward(self, xyzt, batch_size=1024):
+        num_points = xyzt.shape[0]
+        outputs = []
+
+        for i in range(0, num_points, batch_size):
+            batch = xyzt[i:i + batch_size]
+            outputs.append(self._forward_single(batch))
+
+        return torch.cat(outputs, dim=0)
+
+    # @torch.no_grad()
+    def _forward_single(self, xyzt):
+        xyzt = xyzt[..., None, :]
+        scaled = xyzt * self.scalings.view(-1, 1)
+        scaled_f = torch.floor(scaled).to(torch.float32)
+        offset = scaled - scaled_f
+
+        hashed = torch.empty((16, *scaled_f.shape[:-1]), dtype=torch.int64, device=xyzt.device)
+        for i in range(16):
+            mask = [(i >> d) & 1 for d in range(4)]
+            vertex = torch.stack([scaled_f[..., d:d + 1] if not mask[d] else scaled_f[..., d:d + 1] + 1 for d in range(4)], dim=-1)
+            hashed[i] = self.hash_fn(vertex)
+
+        hashed = hashed.view(16, -1)
+        features = self.hash_table[hashed].view(16, *scaled_f.shape[:-1], self.features_per_level)
+
+        for d in range(4):
+            features = torch.lerp(features[::2], features[1::2], offset[..., d:d + 1])
+
+        return torch.flatten(features, start_dim=-2, end_dim=-1)

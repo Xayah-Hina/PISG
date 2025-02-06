@@ -22,6 +22,8 @@ class HyFluidArguments:
     depth: int = 192
     ratio = 0.25
 
+    encoder_num_scale: int = 16
+
 
 args = HyFluidArguments()
 
@@ -45,9 +47,9 @@ class HyFluidPipeline:
         encoder_device = HashEncoderHyFluid(
             min_res=np.array([16, 16, 16, 16], dtype=np.int32),
             max_res=np.array([256, 256, 256, 128], dtype=np.int32),
-            num_scales=16,
+            num_scales=args.encoder_num_scale,
         ).to(self.device)
-        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=encoder_device.num_scales * 2).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
 
         # 2. load data to device
@@ -133,9 +135,9 @@ class HyFluidPipeline:
         encoder_device = HashEncoderHyFluid(
             min_res=np.array([16, 16, 16, 16], dtype=np.int32),
             max_res=np.array([256, 256, 256, 128], dtype=np.int32),
-            num_scales=16,
+            num_scales=args.encoder_num_scale,
         ).to(self.device)
-        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=encoder_device.num_scales * 2).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         ckpt = torch.load("final_ckp.tar")
         encoder_device.load_state_dict(ckpt['encoder_state_dict'])
         model_device.load_state_dict(ckpt['model_state_dict'])
