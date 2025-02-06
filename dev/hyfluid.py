@@ -13,13 +13,13 @@ from dataclasses import dataclass
 
 @dataclass
 class HyFluidArguments:
-    total_iters: int = 100000
-    batch_size: int = 1024
+    total_iters: int = 10000
+    batch_size: int = 256
 
     near: float = 1.1
     far: float = 1.5
     depth: int = 192
-    ratio = 1.0
+    ratio = 0.25
 
 
 args = HyFluidArguments()
@@ -145,7 +145,7 @@ class HyFluidPipeline:
             points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
 
             for _ in tqdm.trange(0, N_frames):
-                test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)
+                test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
                 test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                 chunk = 512 * 64
