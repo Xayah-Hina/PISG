@@ -24,7 +24,7 @@ import random
 import os
 
 from dataclasses import dataclass
-from pytorch_memlab import profile_every
+# from pytorch_memlab import profile_every
 from torch.amp import autocast
 
 
@@ -52,9 +52,9 @@ class HyFluidPipeline:
         self.dtype_numpy = dtype_numpy
         self.dtype_device = dtype_device
 
-    def train_density_numpy(self):
+    def train_density_numpy(self, save_ckp_path=None):
         """
-        Train the model totally on the device
+        Init data on cpu, train the model totally on the device. much slower than train_density_device
         """
         # 0. constants
 
@@ -78,7 +78,6 @@ class HyFluidPipeline:
         N_rays = len(train_indices) * height * width
         rays_iter = N_rays
 
-        loss_history = []
         rays_origin_flatten_numpy, rays_direction_flatten_numpy, rays_random_idxs_numpy, train_video_resampled_flatten_numpy = None, None, None, None
         for _ in tqdm.trange(0, args.total_iters):
             # resample rays
@@ -122,22 +121,20 @@ class HyFluidPipeline:
             optimizer.step()
             if _ % 100 == 0:
                 tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
-                loss_history.append(loss_image.item())
-        loss_array = np.array(loss_history)
-        np.save("training_loss.npy", loss_array)
 
-        torch.save({
-            'encoder_state_dict': encoder_device.state_dict(),
-            'model_state_dict': model_device.state_dict(),
-            'width': width,
-            'height': height,
-            'N_frames': N_frames,
-        }, "final_ckp.tar")
+        if save_ckp_path is not None:
+            torch.save({
+                'encoder_state_dict': encoder_device.state_dict(),
+                'model_state_dict': model_device.state_dict(),
+                'width': width,
+                'height': height,
+                'N_frames': N_frames,
+            }, save_ckp_path)
 
-    @profile_every()
+    # @profile_every()
     def train_density_device(self, save_ckp_path=None):
         """
-        Train the model totally on the device
+        Train the model totally on the device, much faster than train_density_numpy
         """
         # 0. constants
 
@@ -287,12 +284,12 @@ class HyFluidPipeline:
                 loss_history.append(loss_image.item())
         loss_array = np.array(loss_history)
 
-    def test_density_device(self, save_ckp_path=None):
+    def test_density_device(self, save_ckp_path=None, output_dir="output"):
         """
         Test the model totally on the device
         """
         # 0. constants
-        import imageio.v2 as imageio
+        import imageio.v3 as imageio
 
         # 1. load encoder, model, optimizer
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
@@ -339,18 +336,16 @@ class HyFluidPipeline:
                             chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chuck, 3)
                             rgb_map_flat_list.append(chunk_rgb_map_flat)  # (chuck, 3)
                         rgb_map_flat = torch.cat(rgb_map_flat_list, 0)  # (H * W, 3)
-                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])
+                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
 
-                    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-                    rgb8 = to8b(rgb_map.cpu().numpy())
-                    os.makedirs('output', exist_ok=True)
-                    imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
+                    rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
+                    os.makedirs(output_dir, exist_ok=True)
+                    imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
 
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
-    # hyfluid.train_density_numpy()
-    # hyfluid.train_density_device()
-    # hyfluid.test_density_numpy()
-    hyfluid.test_density_device()
+    # hyfluid.train_density_numpy("final_ckp.tar")
+    hyfluid.train_density_device("final_ckp.tar")
+    hyfluid.test_density_device("final_ckp.tar")
