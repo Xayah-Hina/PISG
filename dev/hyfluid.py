@@ -25,7 +25,7 @@ import os
 
 from dataclasses import dataclass
 from pytorch_memlab import profile_every
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 
 @dataclass
@@ -321,7 +321,7 @@ class HyFluidPipeline:
                     test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
-                    with autocast():
+                    with autocast("cuda"):
                         raw_flat = model_device(encoder_device(test_input_xyzt_flat))
                     raw = raw_flat.reshape(height * width, args.depth, 1)  # (H * W, #depth, 1)
                     rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
@@ -371,7 +371,7 @@ class HyFluidPipeline:
                     test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
-                    with autocast():
+                    with autocast("cuda"):
                         rgb_map_flat_list = []
                         ratio = 1
                         delta = height // ratio
