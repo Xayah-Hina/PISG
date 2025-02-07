@@ -370,16 +370,22 @@ class HyFluidPipeline:
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                     with autocast():
-                        raw_flat = model_device(encoder_device(test_input_xyzt_flat, to_cpu=True))
+                        chunk_size = 1024
+                        raw_flat_list = []
+                        for i in range(0, test_input_xyzt_flat.shape[0], chunk_size):
+                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[i:i + chunk_size]
+                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))
+                            raw_flat_list.append(chunk_raw_flat.cpu())
+                        raw_flat = torch.cat(raw_flat_list, 0)  # (H * W * #depth, 1)
                     raw = raw_flat.reshape(height * width, args.depth, 1)  # (H * W, #depth, 1)
-                    rgb_trained = torch.ones(3) * (0.6 + torch.tanh(model_device.rgb.cpu()) * 0.4)
+                    rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
                     alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * depths)
-                    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+                    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
                     rgb_map_flat = torch.sum(weights[..., None] * rgb_trained, -2)  # (H * W, 3)
                     rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
 
                     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-                    rgb8 = to8b(rgb_map.numpy())
+                    rgb8 = to8b(rgb_map.cpu().numpy())
                     os.makedirs('output', exist_ok=True)
                     imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
 
