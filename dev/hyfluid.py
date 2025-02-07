@@ -36,7 +36,7 @@ class HyFluidArguments:
     near: float = 1.1
     far: float = 1.5
     depth: int = 192
-    ratio = 1.0
+    ratio = 0.5
 
     encoder_num_scale: int = 16
 
@@ -209,7 +209,7 @@ class HyFluidPipeline:
                 'N_frames': N_frames,
             }, save_ckp_path)
 
-    def train_density_with_visualizer_device(self, save_ckp_path=None, resolution=256):
+    def train_density_with_visualizer_device(self, save_ckp_path=None, resolution=64):
         """
         TODO: Implement this
         """
@@ -291,9 +291,16 @@ class HyFluidPipeline:
 
             if _ % 100 == 0:
                 with torch.no_grad():
-                    grid_raw_flat = model_device(encoder_device(grids_input_xyzt_flat_device))  # (N_frames * res * res * res, 1)
-                    grid_raw = grid_raw_flat.reshape(N_frames, resolution, resolution, resolution, 1)  # (N_frames, res, res, res, 1)
-                    np.save(f"output/grid_raw_{_ // 100:03d}.npy", grid_raw.cpu().numpy())
+                    delta = N_frames
+                    offset_points = resolution * resolution * resolution
+                    grid_raw_flat_list = []
+                    for h in range(delta):
+                        chunk_test_input_xyzt_flat = grids_input_xyzt_flat_device[h * offset_points:(h + 1) * offset_points]
+                        chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))
+                        grid_raw_flat_list.append(chunk_raw_flat)
+                    grid_raw_flat = torch.cat(grid_raw_flat_list, 0)
+                    grid_raw = grid_raw_flat.reshape(N_frames, resolution, resolution, resolution, 1)
+                    np.savez_compressed(f"output/grid_raw_{_ // 100:03d}.npy", den=grid_raw.cpu().numpy())
 
         loss_array = np.array(loss_history)
         np.save("output/loss.npy", loss_array)
