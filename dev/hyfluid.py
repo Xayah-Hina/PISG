@@ -366,26 +366,27 @@ class HyFluidPipeline:
                 points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
 
                 for _ in tqdm.trange(0, N_frames):
+                    rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+
                     test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                     with autocast():
-                        chunk_size = 1024
-                        raw_flat_list = []
+                        chunk_size = 128 * args.depth
+                        rgb_map_flat_list = []
                         for i in range(0, test_input_xyzt_flat.shape[0], chunk_size):
-                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[i:i + chunk_size]
-                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))
-                            raw_flat_list.append(chunk_raw_flat.cpu())
-                        raw_flat = torch.cat(raw_flat_list, 0)  # (H * W * #depth, 1)
-                    raw = raw_flat.reshape(height * width, args.depth, 1)  # (H * W, #depth, 1)
-                    rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
-                    alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * depths)
-                    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
-                    rgb_map_flat = torch.sum(weights[..., None] * rgb_trained, -2)  # (H * W, 3)
-                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[i:i + chunk_size]  # (chunk_size * #depth, 4)
+                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chunk_size * #depth, 1)
+                            chunk_raw = chunk_raw_flat.reshape(-1, args.depth, 1)  # (chunk_size, #depth, 1)
+                            chunk_alpha = 1. - torch.exp(-torch.nn.functional.relu(chunk_raw[..., -1]) * depths)  # (chunk_size, #depth)
+                            chunk_weights = chunk_alpha * torch.cumprod(torch.cat([torch.ones((chunk_alpha.shape[0], 1), device=self.device), 1. - chunk_alpha + 1e-10], -1), -1)[:, :-1]  # (chunk_size, #depth)
+                            chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chunk_size, 3)
+                            rgb_map_flat_list.append(chunk_rgb_map_flat.cpu())  # (chunk_size, 3)
+                        rgb_map_flat = torch.cat(rgb_map_flat_list, 0)
+                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])
 
                     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-                    rgb8 = to8b(rgb_map.cpu().numpy())
+                    rgb8 = to8b(rgb_map.numpy())
                     os.makedirs('output', exist_ok=True)
                     imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
 
