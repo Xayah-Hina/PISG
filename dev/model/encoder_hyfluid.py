@@ -136,7 +136,7 @@ class HashEncoderNative(torch.nn.Module):
         out = interpolated.view(interpolated.shape[0], -1)
         return out
 
-    def forward(self, xyzt: torch.Tensor, chunk_size=512 * 64):
+    def forward(self, xyzt: torch.Tensor, to_cpu=False, chunk_size=512 * 64):
         """
         对超大 xyzt 进行分批 (chunk) 处理。
         xyzt: 形状 [N, 4]（或更高维度，但最终展平到 [N, 4] 也行）
@@ -150,6 +150,8 @@ class HashEncoderNative(torch.nn.Module):
             end = min(start + chunk_size, N)
             chunk = xyzt[start:end]  # [chunk_size, 4]
             out_chunk = self._forward_chunk(chunk)
+            if to_cpu:
+                out_chunk = out_chunk.cpu()
             results.append(out_chunk)
             start = end
 
