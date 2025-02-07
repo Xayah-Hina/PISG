@@ -372,17 +372,20 @@ class HyFluidPipeline:
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                     with autocast():
-                        chunk_size = 128 * args.depth
+
                         rgb_map_flat_list = []
-                        for i in range(0, test_input_xyzt_flat.shape[0], chunk_size):
-                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[i:i + chunk_size]  # (chunk_size * #depth, 4)
-                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chunk_size * #depth, 1)
-                            chunk_raw = chunk_raw_flat.reshape(-1, args.depth, 1)  # (chunk_size, #depth, 1)
-                            chunk_alpha = 1. - torch.exp(-torch.nn.functional.relu(chunk_raw[..., -1]) * depths)  # (chunk_size, #depth)
-                            chunk_weights = chunk_alpha * torch.cumprod(torch.cat([torch.ones((chunk_alpha.shape[0], 1), device=self.device), 1. - chunk_alpha + 1e-10], -1), -1)[:, :-1]  # (chunk_size, #depth)
-                            chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chunk_size, 3)
-                            rgb_map_flat_list.append(chunk_rgb_map_flat.cpu())  # (chunk_size, 3)
-                        rgb_map_flat = torch.cat(rgb_map_flat_list, 0)
+                        offset_points = width * args.depth * height
+                        offset_depths = width * args.depth
+                        for h in range(height):
+                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[h * offset_points:(h + 1) * offset_points]  # (chuck * #depth, 4)
+                            chunk_depths = depths[h * offset_depths:(h + 1) * offset_depths]  # (chuck, #depth)
+                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chuck * #depth, 1)
+                            chunk_raw = chunk_raw_flat.reshape(-1, args.depth, 1)  # (chuck, #depth, 1)
+                            chunk_alpha = 1. - torch.exp(-torch.nn.functional.relu(chunk_raw[..., -1]) * chunk_depths)  # (chuck, #depth)
+                            chunk_weights = chunk_alpha * torch.cumprod(torch.cat([torch.ones((chunk_alpha.shape[0], 1), device=self.device), 1. - chunk_alpha + 1e-10], -1), -1)[:, :-1]  # (chuck, #depth)
+                            chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chuck, 3)
+                            rgb_map_flat_list.append(chunk_rgb_map_flat)  # (chuck, 3)
+                        rgb_map_flat = torch.cat(rgb_map_flat_list, 0)  # (H * W, 3)
                     rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])
 
                     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
@@ -394,7 +397,7 @@ class HyFluidPipeline:
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
-    hyfluid.train_density_numpy()
+    # hyfluid.train_density_numpy()
     # hyfluid.train_density_device()
     # hyfluid.test_density_numpy()
-    # hyfluid.test_density_device()
+    hyfluid.test_density_device()
