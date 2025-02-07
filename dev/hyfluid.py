@@ -86,8 +86,7 @@ class HyFluidPipeline:
                 _rays_origin_numpy, _rays_direction_numpy, _u_numpy, _v_numpy = generate_rays_numpy(train_poses_numpy, focals=focals_numpy, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (H, W)
                 rays_origin_flatten_numpy, rays_direction_flatten_numpy = _rays_origin_numpy.reshape(-1, 3), _rays_direction_numpy.reshape(-1, 3)  # (#cameras * H * W, 3), (#cameras * H * W, 3)
                 rays_random_idxs_numpy = np.random.permutation(N_rays).astype(np.int32)  # (#cameras * H * W)
-                _train_video_resampled_numpy = resample_images_scipy(train_video_data_numpy, _u_numpy, _v_numpy)  # (#frames, #videos, H, W, C)
-                train_video_resampled_flatten_numpy = _train_video_resampled_numpy.reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
+                train_video_resampled_flatten_numpy = resample_images_scipy(train_video_data_numpy, _u_numpy, _v_numpy).reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
                 rays_iter = 0
             pixels_idxs = rays_random_idxs_numpy[rays_iter:rays_iter + args.batch_size]
             rays_iter += args.batch_size
@@ -166,8 +165,7 @@ class HyFluidPipeline:
                 _rays_origin_device, _rays_direction_device, _u_device, _v_device = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (H, W)
                 rays_origin_flatten_device, rays_direction_flatten_device = _rays_origin_device.reshape(-1, 3), _rays_direction_device.reshape(-1, 3)  # (#cameras * H * W, 3), (#cameras * H * W, 3)
                 rays_random_idxs_device = torch.randperm(N_rays, device=self.device, dtype=torch.int32)  # (#cameras * H * W)
-                _train_video_resampled_device = resample_images_torch(train_video_data_device, _u_device, _v_device)  # (#frames, #videos, H, W, C)
-                train_video_resampled_flatten_device = _train_video_resampled_device.reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
+                train_video_resampled_flatten_device = resample_images_torch(train_video_data_device, _u_device, _v_device).reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
                 rays_iter = 0
             pixels_idxs = rays_random_idxs_device[rays_iter:rays_iter + args.batch_size]
             rays_iter += args.batch_size
@@ -211,11 +209,12 @@ class HyFluidPipeline:
                 'N_frames': N_frames,
             }, save_ckp_path)
 
-    def train_density_with_visualizer_device(self):
+    def train_density_with_visualizer_device(self, save_ckp_path=None, resolution=256):
         """
         TODO: Implement this
         """
         # 0. constants
+        os.makedirs("output", exist_ok=True)
 
         # 1. load encoder, model, optimizer
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
@@ -234,6 +233,14 @@ class HyFluidPipeline:
         focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
 
         # 4. train
+        _xs, _ys, _zs = torch.meshgrid([torch.linspace(0, 1, resolution), torch.linspace(0, 1, resolution), torch.linspace(0, 1, resolution)], indexing='ij')
+        _grids_device = torch.stack([_xs, _ys, _zs], -1).to(self.device)
+        _timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)  # (N_frames)
+        _timesteps_expanded_device = _timesteps_device.view(N_frames, 1, 1, 1, 1).expand(-1, resolution, resolution, resolution, 1)  # (N_frames, res, res, res, 1)
+        _grids_expanded_device = _grids_device.unsqueeze(0).expand(N_frames, -1, -1, -1, -1)  # (N_frames, res, res, res, 3)
+        grids_input_xyzt_device = torch.cat([_grids_expanded_device, _timesteps_expanded_device], dim=-1)  # (N_frames, res, res, res, 4)
+        grids_input_xyzt_flat_device = grids_input_xyzt_device.reshape(-1, 4)  # (N_frames * res * res * res, 4)
+
         N_rays = len(train_indices) * height * width
         rays_iter = N_rays
 
@@ -246,8 +253,7 @@ class HyFluidPipeline:
                 _rays_origin_device, _rays_direction_device, _u_device, _v_device = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=True)  # (#cameras, H, W, 3), (H, W)
                 rays_origin_flatten_device, rays_direction_flatten_device = _rays_origin_device.reshape(-1, 3), _rays_direction_device.reshape(-1, 3)  # (#cameras * H * W, 3), (#cameras * H * W, 3)
                 rays_random_idxs_device = torch.randperm(N_rays, device=self.device, dtype=torch.int32)  # (#cameras * H * W)
-                _train_video_resampled_device = resample_images_torch(train_video_data_device, _u_device, _v_device)  # (#frames, #videos, H, W, C)
-                train_video_resampled_flatten_device = _train_video_resampled_device.reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
+                train_video_resampled_flatten_device = resample_images_torch(train_video_data_device, _u_device, _v_device).reshape(N_frames, -1, 3)  # (#frames, #cameras * H * W, 3)
                 rays_iter = 0
             pixels_idxs = rays_random_idxs_device[rays_iter:rays_iter + args.batch_size]
             rays_iter += args.batch_size
@@ -282,7 +288,24 @@ class HyFluidPipeline:
             if _ % 100 == 0:
                 tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
                 loss_history.append(loss_image.item())
+
+            if _ % 100 == 0:
+                with torch.no_grad():
+                    grid_raw_flat = model_device(encoder_device(grids_input_xyzt_flat_device))  # (N_frames * res * res * res, 1)
+                    grid_raw = grid_raw_flat.reshape(N_frames, resolution, resolution, resolution, 1)  # (N_frames, res, res, res, 1)
+                    np.save(f"output/grid_raw_{_ // 100:03d}.npy", grid_raw.cpu().numpy())
+
         loss_array = np.array(loss_history)
+        np.save("output/loss.npy", loss_array)
+
+        if save_ckp_path is not None:
+            torch.save({
+                'encoder_state_dict': encoder_device.state_dict(),
+                'model_state_dict': model_device.state_dict(),
+                'width': width,
+                'height': height,
+                'N_frames': N_frames,
+            }, save_ckp_path)
 
     def test_density_device(self, save_ckp_path=None, output_dir="output"):
         """
@@ -290,6 +313,7 @@ class HyFluidPipeline:
         """
         # 0. constants
         import imageio.v3 as imageio
+        os.makedirs(output_dir, exist_ok=True)
 
         # 1. load encoder, model, optimizer
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
@@ -339,7 +363,6 @@ class HyFluidPipeline:
                     rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
 
                     rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
-                    os.makedirs(output_dir, exist_ok=True)
                     imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
 
