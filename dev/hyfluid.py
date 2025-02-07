@@ -217,7 +217,7 @@ class HyFluidPipeline:
         }, "final_ckp.tar")
 
     def test_density_numpy(self):
-        pass
+        self.test_density_device()
 
     def test_density_device(self):
         """
@@ -263,6 +263,7 @@ class HyFluidPipeline:
 
                     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
                     rgb8 = to8b(rgb_map.cpu().numpy())
+                    os.makedirs('output', exist_ok=True)
                     imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
 
 
