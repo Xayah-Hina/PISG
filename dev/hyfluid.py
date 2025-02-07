@@ -234,7 +234,7 @@ class HyFluidPipeline:
 
         # 4. train
         _xs, _ys, _zs = torch.meshgrid([torch.linspace(0, 1, resolution), torch.linspace(0, 1, resolution), torch.linspace(0, 1, resolution)], indexing='ij')
-        _grids_device = torch.stack([_xs, _ys, _zs], -1).to(self.device)
+        _grids_device = torch.stack([_xs, _ys, -_zs], -1).to(self.device)
         _timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)  # (N_frames)
         _timesteps_expanded_device = _timesteps_device.view(N_frames, 1, 1, 1, 1).expand(-1, resolution, resolution, resolution, 1)  # (N_frames, res, res, res, 1)
         _grids_expanded_device = _grids_device.unsqueeze(0).expand(N_frames, -1, -1, -1, -1)  # (N_frames, res, res, res, 3)
