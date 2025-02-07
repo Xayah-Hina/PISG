@@ -148,7 +148,7 @@ class HashEncoderNative(torch.nn.Module):
         start = 0
         while start < N:
             end = min(start + chunk_size, N)
-            chunk = xyzt[start:end].to(self.device)  # [chunk_size, 4]
+            chunk = xyzt[start:end]  # [chunk_size, 4]
             out_chunk = self._forward_chunk(chunk)
             results.append(out_chunk)
             start = end
