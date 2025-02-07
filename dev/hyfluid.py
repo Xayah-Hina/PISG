@@ -372,11 +372,12 @@ class HyFluidPipeline:
                     test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                     with autocast():
-
                         rgb_map_flat_list = []
-                        offset_points = width * args.depth * height
-                        offset_depths = width * args.depth
-                        for h in range(height):
+                        ratio = 1
+                        delta = height // ratio
+                        offset_points = width * args.depth * ratio
+                        offset_depths = width * ratio
+                        for h in range(delta):
                             chunk_test_input_xyzt_flat = test_input_xyzt_flat[h * offset_points:(h + 1) * offset_points]  # (chuck * #depth, 4)
                             chunk_depths = depths[h * offset_depths:(h + 1) * offset_depths]  # (chuck, #depth)
                             chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chuck * #depth, 1)
@@ -389,7 +390,7 @@ class HyFluidPipeline:
                     rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])
 
                     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-                    rgb8 = to8b(rgb_map.numpy())
+                    rgb8 = to8b(rgb_map.cpu().numpy())
                     os.makedirs('output', exist_ok=True)
                     imageio.imsave(os.path.join("output", 'rgb_{:03d}.png'.format(_)), rgb8)
 
