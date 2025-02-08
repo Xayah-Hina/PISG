@@ -211,7 +211,7 @@ class HyFluidPipeline:
 
     def train_density_with_visualizer_device(self, save_ckp_path=None, resolution=64):
         """
-        TODO: Implement this
+        Train the model totally on the device, and save the grid_raw for visualization
         """
         # 0. constants
         os.makedirs("output", exist_ok=True)
