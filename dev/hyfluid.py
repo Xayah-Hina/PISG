@@ -15,6 +15,7 @@ from utils.utils_nerf import (
     resample_images_torch,
     get_points_device
 )
+from spatial_structures.occupancy_grid import points_in_camera_frustum
 from model.model_hyfluid import NeRFSmall
 from model.encoder_hyfluid import HashEncoderNative
 import torch
@@ -372,10 +373,39 @@ class HyFluidPipeline:
                     rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
                     imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
+    def test_og(self):
+        width, height = 1080, 1920
+        near, far = 1.1, 1.5
+        depth = 192
+
+        train_indices = [4]
+        train_poses_device = torch.tensor([self.camera_infos[i].transform_matrices for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras, 4, 4)
+        focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
+        rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
+        rays_origin_device, rays_direction_device = rays_origin_device.reshape(rays_origin_device.shape[0], -1, 3), rays_direction_device.reshape(rays_direction_device.shape[0], -1, 3)  # (#cameras, H * W, 3), (#cameras, H * W, 3)
+        rays_o, rays_d = rays_origin_device[0], rays_direction_device[0]
+        points, _ = get_points_device(rays_o, rays_d, 1.1, 1.5, depth, randomize=False)
+        camera_angle_x = torch.tensor([self.camera_infos[i].camera_angle_x[0] for i in train_indices], device=self.device, dtype=self.dtype_device)
+
+        visible_mask, frustum_corners_world = points_in_camera_frustum(
+            points.reshape(-1, 3),
+            train_poses_device[0],
+            camera_angle_x[0].item(),
+            width,
+            height,
+            near,
+            far
+        )
+
+        print(visible_mask.shape)
+        print(frustum_corners_world)
+
 
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
-    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
+    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cpu"), dtype_numpy=np.float32, dtype_device=torch.float32)
     # hyfluid.train_density_numpy("final_ckp.tar")
-    hyfluid.train_density_device("final_ckp.tar")
-    hyfluid.test_density_device("final_ckp.tar")
+    # hyfluid.train_density_device("final_ckp.tar")
+    # hyfluid.test_density_device("final_ckp.tar")
+
+    hyfluid.test_og()
