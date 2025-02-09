@@ -397,13 +397,24 @@ class HyFluidPipeline:
             far
         )
 
-        print(visible_mask.shape)
-        print(frustum_corners_world)
+        points = points.reshape(width, height, depth, 3)
+        visible_mask = visible_mask.reshape(width, height, depth)
+
+        # 计算 True 的数量
+        true_count = visible_mask.sum()
+
+        # 计算 False 的数量
+        false_count = visible_mask.numel() - true_count  # 总元素数减去 True 的数量
+
+        print(f"Number of True: {true_count}")
+        print(f"Number of False: {false_count}")
+
+        np.savez("points", points=points[::1000].cpu().numpy(), points_mask=points[visible_mask][::100].cpu().numpy())
 
 
 if __name__ == '__main__':
     hyfluid_video_infos.root_dir = "../data/hyfluid"
-    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cpu"), dtype_numpy=np.float32, dtype_device=torch.float32)
+    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
     # hyfluid.train_density_numpy("final_ckp.tar")
     # hyfluid.train_density_device("final_ckp.tar")
     # hyfluid.test_density_device("final_ckp.tar")
