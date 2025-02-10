@@ -18,3 +18,10 @@
   - matplotlib 3.10.0
 - for hyfluid only
   - taichi 1.7.3
+
+```shell
+python -m pip uninstall phiflow
+python -m pip install git+https://github.com/tum-pbs/PhiFlow@develop
+python -m pip uninstall phiml
+python -m pip install git+https://github.com/tum-pbs/PhiML@develop
+```
