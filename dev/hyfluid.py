@@ -421,13 +421,13 @@ class HyFluidPipeline:
 
             poses_360.append(pose_matrix)
 
-        train_poses_device = torch.tensor(poses_360, device=self.device, dtype=self.dtype_device)  # (#frames, 4, 4)
+        train_poses_device = torch.tensor(np.array(poses_360), device=self.device, dtype=self.dtype_device)  # (#frames, 4, 4)
         focals_device = torch.tensor([1306.], device=self.device, dtype=self.dtype_device)  # (#cameras)
         test_timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)
 
         with torch.no_grad():
             for _ in tqdm.trange(0, N_frames):
-                rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device[_:_ + 1], focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
+                rays_origin_device, rays_direction_device, _u, _v = generate_rays_device(train_poses_device[_:_ + 1], focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
                 rays_origin_device, rays_direction_device = rays_origin_device.reshape(rays_origin_device.shape[0], -1, 3), rays_direction_device.reshape(rays_direction_device.shape[0], -1, 3)  # (#cameras, H * W, 3), (#cameras, H * W, 3)
                 for rays_o, rays_d in zip(rays_origin_device, rays_direction_device):
                     points, depths = get_points_device(rays_o, rays_d, args.near, args.far, args.depth, randomize=False)  # (H * W, #depth, 3), (H * W, #depth)
