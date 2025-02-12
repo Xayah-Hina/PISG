@@ -28,10 +28,11 @@ from dataclasses import dataclass
 # from pytorch_memlab import profile_every
 from torch.amp import autocast
 
+import torch.multiprocessing as mp
 
 @dataclass
 class HyFluidArguments:
-    total_iters: int = 10000
+    total_iters: int = 30000
     batch_size: int = 256
 
     near: float = 1.1
@@ -315,7 +316,7 @@ class HyFluidPipeline:
                 'N_frames': N_frames,
             }, save_ckp_path)
 
-    def test_density_device(self, save_ckp_path=None, output_dir="output"):
+    def test_density_device(self, test_indices, save_ckp_path=None, output_dir="output"):
         """
         Test the model totally on the device
         """
@@ -332,9 +333,8 @@ class HyFluidPipeline:
         width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
 
         # 2. load poses
-        train_indices = [4]
-        train_poses_device = torch.tensor([self.camera_infos[i].transform_matrices for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras, 4, 4)
-        focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in train_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
+        train_poses_device = torch.tensor([self.camera_infos[i].transform_matrices for i in test_indices], device=self.device, dtype=self.dtype_device)  # (#cameras, 4, 4)
+        focals_device = torch.tensor([0.5 * width / torch.tan(0.5 * torch.tensor(self.camera_infos[i].camera_angle_x[0], dtype=self.dtype_device)) for i in test_indices], device=self.device, dtype=self.dtype_device)  # (#cameras)
         test_timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)
 
         # 3. resample rays
@@ -372,6 +372,9 @@ class HyFluidPipeline:
 
                     rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
                     imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
+
+    def test_density_rotation_device(self, test_indices, save_ckp_path=None, output_dir="output"):
+        pass
 
     def test_og(self):
         width, height = 1080, 1920
@@ -411,12 +414,27 @@ class HyFluidPipeline:
 
         np.savez("points", points=points[::1000].cpu().numpy(), points_mask=points[visible_mask][::100].cpu().numpy())
 
+def train(rank, world_size):
+    # 根据 rank 选择 GPU 设备
+    device_id = rank % world_size  # 这样可以确保在多个 GPU 之间循环分配
+    device = torch.device(f"cuda:{device_id}")
+    print(f"Process {rank} running on {device}")
 
-if __name__ == '__main__':
+
     hyfluid_video_infos.root_dir = "../data/hyfluid"
-    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=torch.device("cuda"), dtype_numpy=np.float32, dtype_device=torch.float32)
+    hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=device, dtype_numpy=np.float32, dtype_device=torch.float32)
+    if rank == 0:
+        hyfluid.test_density_device([0], "final_ckp.tar", "output_view3")
+    elif rank == 1:
+        hyfluid.test_density_device([1], "final_ckp.tar", "output_view4")
+
+
     # hyfluid.train_density_numpy("final_ckp.tar")
     # hyfluid.train_density_device("final_ckp.tar")
-    # hyfluid.test_density_device("final_ckp.tar")
 
-    hyfluid.test_og()
+
+if __name__ == '__main__':
+    world_size = torch.cuda.device_count()
+    print(f"Launching {world_size} processes for GPU tasks.")
+    mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+
