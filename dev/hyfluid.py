@@ -30,6 +30,7 @@ from torch.amp import autocast
 
 import torch.multiprocessing as mp
 
+
 @dataclass
 class HyFluidArguments:
     total_iters: int = 30000
@@ -373,8 +374,90 @@ class HyFluidPipeline:
                     rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
                     imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
-    def test_density_rotation_device(self, test_indices, save_ckp_path=None, output_dir="output"):
-        pass
+    def test_density_rotation_device(self, save_ckp_path=None, output_dir="output"):
+        """
+        Test the model totally on the device
+        """
+        # 0. constants
+        import imageio.v3 as imageio
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. load encoder, model, optimizer
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
+        ckpt = torch.load(save_ckp_path)
+        encoder_device.load_state_dict(ckpt['encoder_state_dict'])
+        model_device.load_state_dict(ckpt['model_state_dict'])
+        width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
+
+        # 2. load poses
+        num_samples = 120
+        center = np.array([0.3382070094283088, 0.38795384153014023, -0.2609209839653898])
+        radius = 1.3
+        phi_deg = 20
+        phi_rad = np.radians(phi_deg)
+        initial_x = radius * np.cos(phi_rad)
+        initial_z = radius * np.sin(phi_rad)
+        initial_position = np.array([initial_x, 0, initial_z]) + center
+        angle_step_360 = 2 * np.pi / num_samples
+        poses_360 = []
+
+        for i in range(num_samples):
+            theta = i * angle_step_360
+            rotation_matrix = np.array([
+                [np.cos(theta), 0, np.sin(theta), 0],
+                [0, 1, 0, 0],
+                [-np.sin(theta), 0, np.cos(theta), 0],
+                [0, 0, 0, 1]
+            ])
+
+            rotated_position = rotation_matrix @ np.append(initial_position - center, 1)
+            new_position = rotated_position[:3] + center
+
+            # 生成pose矩阵
+            pose_matrix = np.eye(4)
+            pose_matrix[:3, 3] = new_position  # 设置平移向量
+            pose_matrix[:3, :3] = rotation_matrix[:3, :3]  # 设置旋转部分
+
+            poses_360.append(pose_matrix)
+
+        train_poses_device = torch.tensor(poses_360, device=self.device, dtype=self.dtype_device)  # (#frames, 4, 4)
+        focals_device = torch.tensor([1306.], device=self.device, dtype=self.dtype_device)  # (#cameras)
+        test_timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)
+
+        with torch.no_grad():
+            for _ in tqdm.trange(0, N_frames):
+                rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device[_:_ + 1], focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
+                rays_origin_device, rays_direction_device = rays_origin_device.reshape(rays_origin_device.shape[0], -1, 3), rays_direction_device.reshape(rays_direction_device.shape[0], -1, 3)  # (#cameras, H * W, 3), (#cameras, H * W, 3)
+                for rays_o, rays_d in zip(rays_origin_device, rays_direction_device):
+                    points, depths = get_points_device(rays_o, rays_d, args.near, args.far, args.depth, randomize=False)  # (H * W, #depth, 3), (H * W, #depth)
+                    points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
+
+                    rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+
+                    test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
+                    test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
+
+                    with autocast("cuda"):
+                        rgb_map_flat_list = []
+                        ratio = 1
+                        delta = height // ratio
+                        offset_points = width * args.depth * ratio
+                        offset_depths = width * ratio
+                        for h in range(delta):
+                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[h * offset_points:(h + 1) * offset_points]  # (chuck * #depth, 4)
+                            chunk_depths = depths[h * offset_depths:(h + 1) * offset_depths]  # (chuck, #depth)
+                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chuck * #depth, 1)
+                            chunk_raw = chunk_raw_flat.reshape(-1, args.depth, 1)  # (chuck, #depth, 1)
+                            chunk_alpha = 1. - torch.exp(-torch.nn.functional.relu(chunk_raw[..., -1]) * chunk_depths)  # (chuck, #depth)
+                            chunk_weights = chunk_alpha * torch.cumprod(torch.cat([torch.ones((chunk_alpha.shape[0], 1), device=self.device), 1. - chunk_alpha + 1e-10], -1), -1)[:, :-1]  # (chuck, #depth)
+                            chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chuck, 3)
+                            rgb_map_flat_list.append(chunk_rgb_map_flat)  # (chuck, 3)
+                        rgb_map_flat = torch.cat(rgb_map_flat_list, 0)  # (H * W, 3)
+                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+
+                    rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
+                    imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
     def test_og(self):
         width, height = 1080, 1920
@@ -414,12 +497,12 @@ class HyFluidPipeline:
 
         np.savez("points", points=points[::1000].cpu().numpy(), points_mask=points[visible_mask][::100].cpu().numpy())
 
+
 def train(rank, world_size):
     # 根据 rank 选择 GPU 设备
     device_id = rank % world_size  # 这样可以确保在多个 GPU 之间循环分配
     device = torch.device(f"cuda:{device_id}")
     print(f"Process {rank} running on {device}")
-
 
     hyfluid_video_infos.root_dir = "../data/hyfluid"
     hyfluid = HyFluidPipeline(hyfluid_video_infos, hyfluid_camera_infos_list, device=device, dtype_numpy=np.float32, dtype_device=torch.float32)
@@ -428,13 +511,12 @@ def train(rank, world_size):
     elif rank == 1:
         hyfluid.test_density_device([1], "final_ckp.tar", "output_view4")
 
-
     # hyfluid.train_density_numpy("final_ckp.tar")
     # hyfluid.train_density_device("final_ckp.tar")
+    # hyfluid.test_density_rotation_device("final_ckp.tar", "output_view_rot")
 
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
     print(f"Launching {world_size} processes for GPU tasks.")
     mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
-
