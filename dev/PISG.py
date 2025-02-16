@@ -36,6 +36,13 @@ class PISGArguments:
 
 args = PISGArguments()
 
+infos = VideoInfos(
+    root_dir=Path("../data/PISG/scene1"),
+    train_videos=[Path("back.mp4"), Path("front.mp4"), Path("right.mp4"), Path("top.mp4")],
+    validation_videos=[],
+    test_videos=[],
+)
+
 
 class PISGPipeline:
     def __init__(self, video_infos: VideoInfos, device, dtype_numpy, dtype_device):
@@ -134,12 +141,6 @@ class PISGPipeline:
 
 if __name__ == '__main__':
     target_device = torch.device("cuda")
-    infos = VideoInfos(
-        root_dir=Path("../data/PISG/scene1"),
-        train_videos=[Path("back.mp4"), Path("front.mp4"), Path("right.mp4"), Path("top.mp4")],
-        validation_videos=[],
-        test_videos=[],
-    )
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
-    PISG.train_device()
+    PISG.train_device(save_ckp_path="final_ckp.tar")
