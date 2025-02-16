@@ -25,7 +25,7 @@ from torch.amp import autocast
 
 @dataclass
 class PISGArguments:
-    total_iters: int = 10000
+    total_iters: int = 30000
     batch_size: int = 256
 
     near: float = 10
@@ -193,7 +193,7 @@ class PISGPipeline:
 
         # 2. load poses
         camera_infos_path = [
-            Path("cam_front.npz"),
+            Path("cam_right.npz"),
         ]
         camera_infos = [np.load(infos.root_dir / path) for path in camera_infos_path]
         cam_transforms = [torch.tensor(info["cam_transform"], device=self.device, dtype=torch.float32) for info in camera_infos]
@@ -218,7 +218,7 @@ class PISGPipeline:
                 points_normalized = (points_flat - scene_min) / (scene_max - scene_min)
                 # ===============================
 
-                for _ in tqdm.trange(0, N_frames):
+                for _ in tqdm.tqdm(reversed(range(N_frames))):
                     rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
 
                     test_timesteps_expended = test_timesteps_device[_].expand(points_normalized[..., :1].shape)  # (H * W * #depth, 1)
@@ -250,5 +250,5 @@ if __name__ == '__main__':
     target_device = torch.device("cuda")
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
-    PISG.train_device(save_ckp_path="final_ckp.tar")
-    # PISG.test_density(save_ckp_path="final_ckp.tar", out1put_dir="output_PISG")
+    # PISG.train_device(save_ckp_path="final_ckp.tar")
+    PISG.test_density(save_ckp_path="final_ckp.tar", output_dir="output_PISG")
