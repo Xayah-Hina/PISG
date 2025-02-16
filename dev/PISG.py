@@ -152,7 +152,7 @@ class PISGPipeline:
                 loss_avg = loss_accum / 100.0
                 loss_avg_list.append(loss_avg)
                 loss_accum = 0.0
-                tqdm.tqdm.write(f"Average loss over iterations {_ - 98} to {_ + 1}: {loss_avg}")
+                tqdm.tqdm.write(f"Average loss over iterations {_ - 99} to {_}: {loss_avg}")
 
         if save_ckp_path is not None:
             torch.save({
@@ -166,7 +166,8 @@ class PISGPipeline:
         # Added: 绘制每100次iter记录的loss平均值图
         import matplotlib.pyplot as plt
         plt.figure()
-        iterations = list(range(100, args.total_iters + 1, 100))
+        # 根据 loss_avg_list 的长度自动生成 x 轴数据，假设每个 loss 对应 100 个迭代次数
+        iterations = [100 * (i + 1) for i in range(len(loss_avg_list))]
         plt.plot(iterations, loss_avg_list, marker='o')
         plt.xlabel("Iteration")
         plt.ylabel("Average Loss")
