@@ -111,8 +111,16 @@ class PISGPipeline:
             batch_ray_directions = rays_direction_flatten_device[pixels_idxs]  # (#batch, 3)
             batch_target_pixels = target_frame_device[pixels_idxs]  # (#batch, 3)
             batch_points, batch_depths = get_points_device(batch_ray_origins, batch_ray_directions, args.near, args.far, args.depth, randomize=True)  # (#batch, #depth, 3), (#batch, #depth)
+
+            # ===== 新增：归一化 xyz 坐标 =====
+            # 假设场景坐标范围为 [-1, 1]，归一化到 [0, 1] 内。如果你的场景包围盒不同，请相应调整 scene_min 和 scene_max
+            scene_min = torch.tensor([-20.0, -20.0, -20.0], device=self.device, dtype=batch_points.dtype)
+            scene_max = torch.tensor([20.0, 20.0, 20.0], device=self.device, dtype=batch_points.dtype)
+            batch_points_normalized = (batch_points - scene_min) / (scene_max - scene_min)
+            # ===============================
+
             batch_time = torch.tensor(frame / (N_frames - 1), device=self.device, dtype=self.dtype_device)
-            batch_input_xyzt = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)  # (#batch, #depth , 4)
+            batch_input_xyzt = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1)  # (#batch, #depth , 4)
             batch_input_xyzt_flat = batch_input_xyzt.reshape(-1, 4)  # (#batch * #depth, 4)
 
             # forward
@@ -193,11 +201,18 @@ class PISGPipeline:
                 points, depths = get_points_device(rays_o, rays_d, args.near, args.far, args.depth, randomize=False)  # (H * W, #depth, 3), (H * W, #depth)
                 points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
 
+                # ===== 新增：归一化 xyz 坐标 =====
+                # 假设场景坐标范围为 [-1, 1]，归一化到 [0, 1] 内
+                scene_min = torch.tensor([-20.0, -20.0, -20.0], device=self.device, dtype=points_flat.dtype)
+                scene_max = torch.tensor([20.0, 20.0, 20.0], device=self.device, dtype=points_flat.dtype)
+                points_normalized = (points_flat - scene_min) / (scene_max - scene_min)
+                # ===============================
+
                 for _ in tqdm.trange(0, N_frames):
                     rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
 
-                    test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
-                    test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
+                    test_timesteps_expended = test_timesteps_device[_].expand(points_normalized[..., :1].shape)  # (H * W * #depth, 1)
+                    test_input_xyzt_flat = torch.cat([points_normalized, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
 
                     with autocast("cuda"):
                         rgb_map_flat_list = []
@@ -225,5 +240,5 @@ if __name__ == '__main__':
     target_device = torch.device("cuda")
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
-    PISG.train_device(save_ckp_path="final_ckp.tar")
+    # PISG.train_device(save_ckp_path="final_ckp.tar")
     PISG.test_density(save_ckp_path="final_ckp.tar", output_dir="output_PISG")
