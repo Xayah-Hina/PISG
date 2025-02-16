@@ -85,6 +85,9 @@ class PISGPipeline:
         N_rays = N_videos * height * width
         rays_iter = N_rays
 
+        loss_avg_list = []
+        loss_accum = 0.0
+
         rays_origin_flatten_device, rays_direction_flatten_device, rays_random_idxs_device, train_video_resampled_flatten_device = None, None, None, None
         for _ in tqdm.trange(0, args.total_iters):
             # resample rays
@@ -125,8 +128,14 @@ class PISGPipeline:
             optimizer.zero_grad()
             loss_image.backward()
             optimizer.step()
+
+            # Added: 累计loss并每100次iter记录平均loss
+            loss_accum += loss_image.item()
             if _ % 100 == 0:
-                tqdm.tqdm.write(f"loss_image: {loss_image.item()}")
+                loss_avg = loss_accum / 100.0
+                loss_avg_list.append(loss_avg)
+                loss_accum = 0.0
+                tqdm.tqdm.write(f"Average loss over iterations {_ - 98} to {_ + 1}: {loss_avg}")
 
         if save_ckp_path is not None:
             torch.save({
@@ -136,6 +145,17 @@ class PISGPipeline:
                 'height': height,
                 'N_frames': N_frames,
             }, save_ckp_path)
+
+        # Added: 绘制每100次iter记录的loss平均值图
+        import matplotlib.pyplot as plt
+        plt.figure()
+        iterations = list(range(100, args.total_iters + 1, 100))
+        plt.plot(iterations, loss_avg_list, marker='o')
+        plt.xlabel("Iteration")
+        plt.ylabel("Average Loss")
+        plt.title("Average Loss per 100 Iterations")
+        plt.grid(True)
+        plt.show()
 
     def test_density(self, save_ckp_path=None, output_dir="output"):
         """
