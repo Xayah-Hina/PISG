@@ -19,6 +19,7 @@ import os
 
 from dataclasses import dataclass
 from pathlib import Path
+from torch.amp import autocast
 
 
 @dataclass
@@ -138,9 +139,73 @@ class PISGPipeline:
                 'N_frames': N_frames,
             }, save_ckp_path)
 
+    def test_density_device(self, save_ckp_path=None, output_dir="output"):
+        """
+        Test the model totally on the device
+        """
+        # 0. constants
+        import imageio.v3 as imageio
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. load encoder, model, optimizer
+        encoder_device = HashEncoderNative(device=self.device).to(self.device)
+        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
+        ckpt = torch.load(save_ckp_path)
+        encoder_device.load_state_dict(ckpt['encoder_state_dict'])
+        model_device.load_state_dict(ckpt['model_state_dict'])
+        width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
+
+        # 2. load poses
+        camera_infos_path = [
+            Path("cam_front.npz"),
+        ]
+        camera_infos = [np.load(infos.root_dir / path) for path in camera_infos_path]
+        cam_transforms = [torch.tensor(info["cam_transform"], device=self.device, dtype=torch.float32) for info in camera_infos]
+        train_poses_device = torch.stack(cam_transforms)
+        focals_device = torch.tensor([info["focal"] * width / info["aperture"] for info in camera_infos], device=self.device, dtype=torch.float32)
+
+        test_timesteps_device = torch.arange(N_frames, device=self.device, dtype=self.dtype_device) / (N_frames - 1)
+
+        # 3. resample rays
+        rays_origin_device, rays_direction_device, _, _ = generate_rays_device(train_poses_device, focals=focals_device, width=width, height=height, randomize=False)  # (#cameras, H, W, 3), (#cameras, H, W, 3)
+        rays_origin_device, rays_direction_device = rays_origin_device.reshape(rays_origin_device.shape[0], -1, 3), rays_direction_device.reshape(rays_direction_device.shape[0], -1, 3)  # (#cameras, H * W, 3), (#cameras, H * W, 3)
+
+        with torch.no_grad():
+            for rays_o, rays_d in zip(rays_origin_device, rays_direction_device):
+                points, depths = get_points_device(rays_o, rays_d, args.near, args.far, args.depth, randomize=False)  # (H * W, #depth, 3), (H * W, #depth)
+                points_flat = points.reshape(-1, 3)  # (H * W * #depth, 3)
+
+                for _ in tqdm.trange(0, N_frames):
+                    rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
+
+                    test_timesteps_expended = test_timesteps_device[_].expand(points_flat[..., :1].shape)  # (H * W * #depth, 1)
+                    test_input_xyzt_flat = torch.cat([points_flat, test_timesteps_expended], dim=-1)  # (H * W * #depth, 4)
+
+                    with autocast("cuda"):
+                        rgb_map_flat_list = []
+                        ratio = 1
+                        delta = height // ratio
+                        offset_points = width * args.depth * ratio
+                        offset_depths = width * ratio
+                        for h in range(delta):
+                            chunk_test_input_xyzt_flat = test_input_xyzt_flat[h * offset_points:(h + 1) * offset_points]  # (chuck * #depth, 4)
+                            chunk_depths = depths[h * offset_depths:(h + 1) * offset_depths]  # (chuck, #depth)
+                            chunk_raw_flat = model_device(encoder_device(chunk_test_input_xyzt_flat))  # (chuck * #depth, 1)
+                            chunk_raw = chunk_raw_flat.reshape(-1, args.depth, 1)  # (chuck, #depth, 1)
+                            chunk_alpha = 1. - torch.exp(-torch.nn.functional.relu(chunk_raw[..., -1]) * chunk_depths)  # (chuck, #depth)
+                            chunk_weights = chunk_alpha * torch.cumprod(torch.cat([torch.ones((chunk_alpha.shape[0], 1), device=self.device), 1. - chunk_alpha + 1e-10], -1), -1)[:, :-1]  # (chuck, #depth)
+                            chunk_rgb_map_flat = torch.sum(chunk_weights[..., None] * rgb_trained, -2)  # (chuck, 3)
+                            rgb_map_flat_list.append(chunk_rgb_map_flat)  # (chuck, 3)
+                        rgb_map_flat = torch.cat(rgb_map_flat_list, 0)  # (H * W, 3)
+                    rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+
+                    rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
+                    imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
+
 
 if __name__ == '__main__':
     target_device = torch.device("cuda")
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
     PISG.train_device(save_ckp_path="final_ckp.tar")
+    # PISG.test_density_device(save_ckp_path="final_ckp.tar")
