@@ -24,7 +24,7 @@ from torch.amp import autocast
 
 @dataclass
 class PISGArguments:
-    total_iters: int = 30000
+    total_iters: int = 10000
     batch_size: int = 256
 
     near: float = 10
@@ -32,7 +32,7 @@ class PISGArguments:
     depth: int = 192
 
     encoder_num_scale: int = 16
-    ratio = 0.5
+    ratio = 1.0
 
 
 args = PISGArguments()
@@ -80,8 +80,6 @@ class PISGPipeline:
         cam_transforms = [torch.tensor(info["cam_transform"], device=self.device, dtype=torch.float32) for info in camera_infos]
         train_poses_device = torch.stack(cam_transforms)
         focal_pixels_device = torch.tensor([info["focal"] * width / info["aperture"] for info in camera_infos], device=self.device, dtype=torch.float32)
-        print(train_poses_device)
-        print(focal_pixels_device)
 
         # 4. train
         N_rays = N_videos * height * width
@@ -139,7 +137,7 @@ class PISGPipeline:
                 'N_frames': N_frames,
             }, save_ckp_path)
 
-    def test_density_device(self, save_ckp_path=None, output_dir="output"):
+    def test_density(self, save_ckp_path=None, output_dir="output"):
         """
         Test the model totally on the device
         """
@@ -147,7 +145,7 @@ class PISGPipeline:
         import imageio.v3 as imageio
         os.makedirs(output_dir, exist_ok=True)
 
-        # 1. load encoder, model, optimizer
+        # 1. load encoder, model
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         ckpt = torch.load(save_ckp_path)
@@ -208,4 +206,4 @@ if __name__ == '__main__':
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
     PISG.train_device(save_ckp_path="final_ckp.tar")
-    # PISG.test_density_device(save_ckp_path="final_ckp.tar")
+    PISG.test_density(save_ckp_path="final_ckp.tar", output_dir="output_PISG")
