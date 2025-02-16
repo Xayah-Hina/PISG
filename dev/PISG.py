@@ -16,6 +16,7 @@ import numpy as np
 import tqdm
 import random
 import os
+import math
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,11 @@ class PISGPipeline:
         encoder_device = HashEncoderNative(device=self.device).to(self.device)
         model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
         optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
+
+        # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10%
+        target_lr_ratio = 0.1  # 你可以根据需求调整目标比例
+        gamma = math.exp(math.log(target_lr_ratio) / args.total_iters)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
         # 2. load data to device
         train_video_data_device = load_videos_data_device(self.video_infos, dataset_type="train", device=self.device, dtype=self.dtype_device)  # (#videos, #frames, H, W, C)
@@ -137,9 +143,12 @@ class PISGPipeline:
             loss_image.backward()
             optimizer.step()
 
+            # 每个 iteration 后更新一次学习率
+            scheduler.step()
+
             # Added: 累计loss并每100次iter记录平均loss
             loss_accum += loss_image.item()
-            if _ % 100 == 0:
+            if _ % 100 == 0 and _ > 0:
                 loss_avg = loss_accum / 100.0
                 loss_avg_list.append(loss_avg)
                 loss_accum = 0.0
@@ -240,5 +249,5 @@ if __name__ == '__main__':
     target_device = torch.device("cuda")
 
     PISG = PISGPipeline(video_infos=infos, device=target_device, dtype_numpy=np.float32, dtype_device=torch.float32)
-    # PISG.train_device(save_ckp_path="final_ckp.tar")
-    PISG.test_density(save_ckp_path="final_ckp.tar", output_dir="output_PISG")
+    PISG.train_device(save_ckp_path="final_ckp.tar")
+    # PISG.test_density(save_ckp_path="final_ckp.tar", out1put_dir="output_PISG")
