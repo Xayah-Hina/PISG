@@ -8,24 +8,6 @@ from pathlib import Path
 from model.model_hyfluid import NeRFSmall
 from model.encoder_hyfluid import HashEncoderNative
 
-from dataclasses import dataclass
-
-
-@dataclass
-class PISGArguments:
-    total_iters: int = 30000
-    batch_size: int = 256
-
-    near: float = 10
-    far: float = 21.6
-    depth: int = 192
-
-    encoder_num_scale: int = 16
-    ratio = 1.0
-
-
-args = PISGArguments()
-
 
 def find_relative_paths(relative_path_list):
     current_dir = Path.cwd()
@@ -67,22 +49,24 @@ class PISGPipelineTorch:
     def __init__(self, torch_device: torch.device, torch_dtype: torch.dtype):
         self.device = torch_device
         self.dtype = torch_dtype
+        self.encoder_num_scale = 16
+        self.depth = 192
 
-    def train(self):
-        encoder_device = HashEncoderNative(device=self.device).to(self.device)
-        model_device = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=args.encoder_num_scale * 2).to(self.device)
-        optimizer = torch.optim.RAdam([{'params': model_device.parameters(), 'weight_decay': 1e-6}, {'params': encoder_device.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
+        self.encoder = HashEncoderNative(device=self.device).to(self.device)
+        self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
+        self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
 
         # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10%
         target_lr_ratio = 0.1  # 你可以根据需求调整目标比例
-        gamma = math.exp(math.log(target_lr_ratio) / args.total_iters)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+        gamma = math.exp(math.log(target_lr_ratio) / 30000)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
+    def train(self):
         videos_data = self.load_videos_data(*training_videos).permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
 
         import tqdm
-        iter = 0
+        train_iter = 0
         loss_avg_list = []
         loss_accum = 0.0
         batch_size = 1024
@@ -90,58 +74,48 @@ class PISGPipelineTorch:
             u, v, dirs = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
             videos_data_resampled = self.resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=32, batch_size=batch_size, randomize=True)):
-                iter += 1
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True)):
+                train_iter += 1
 
-                frame = random.uniform(0, videos_data_resampled.shape[0] - 1)
-                frame_floor, frame_ceil, frames_alpha = int(frame), int(frame) + 1, frame - int(frame)
-                target_frame = (1 - frames_alpha) * videos_data_resampled[frame_floor] + frames_alpha * videos_data_resampled[frame_ceil]  # (V * H * W, C)
-                batch_target_pixels = target_frame[batch_indices]  # (batch_size, C)
+                batch_time, batch_target_pixels = self.sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices)  # (batch_size, C)
+                batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
+                batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
 
-                # ===== 新增：归一化 xyz 坐标 =====
-                # 假设场景坐标范围为 [-1, 1]，归一化到 [0, 1] 内。如果你的场景包围盒不同，请相应调整 scene_min 和 scene_max
-                scene_min = torch.tensor([-20.0, -20.0, -20.0], device=self.device, dtype=self.dtype)
-                scene_max = torch.tensor([20.0, 20.0, 20.0], device=self.device, dtype=self.dtype)
-                batch_points_normalized = (batch_points - scene_min) / (scene_max - scene_min)  # (batch_size, depth, 3)
-                # ===============================
-
-                batch_time = torch.tensor(frame / (videos_data_resampled.shape[0] - 1), device=self.device, dtype=self.dtype)
-                batch_input_xyzt = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1)  # (batch_size, depth, 4)
-                batch_input_xyzt_flat = batch_input_xyzt.reshape(-1, 4)  # (batch_size * depth, 4)
-
-                # forward
-                raw_flat = model_device(encoder_device(batch_input_xyzt_flat))  # (batch_size * depth, 4)
-                raw = raw_flat.reshape(-1, args.depth, 1)  # (batch_size, depth, 4)
-                rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(model_device.rgb) * 0.4)
-                alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
-                weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
-                rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+                rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
 
                 # optimize loss
                 loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 loss_image.backward()
-                optimizer.step()
-
-                # 每个 iteration 后更新一次学习率
-                scheduler.step()
+                self.optimizer.step()
+                self.scheduler.step()
 
                 loss_accum += loss_image.item()
-                if iter % 100 == 0 and iter > 0:
+                if train_iter % 100 == 0 and train_iter > 0:
                     loss_avg = loss_accum / 100.0
                     loss_avg_list.append(loss_avg)
                     loss_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {iter - 99} to {iter}: {loss_avg}")
+                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg}")
 
         save_ckp_path = "final_ckp.tar"
         if save_ckp_path is not None:
             torch.save({
-                'encoder_state_dict': encoder_device.state_dict(),
-                'model_state_dict': model_device.state_dict(),
+                'encoder_state_dict': self.encoder.state_dict(),
+                'model_state_dict': self.model.state_dict(),
                 'width': width,
                 'height': height,
                 'N_frames': 120,
             }, save_ckp_path)
+
+    def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
+        raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
+        raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
+        rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
+        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
+        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+        rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+
+        return rgb_map
 
     def load_videos_data(self, *video_paths):
         """
@@ -237,6 +211,43 @@ class PISGPipelineTorch:
         resampled = torch.nn.functional.grid_sample(reshaped_images, grid.expand(reshaped_images.shape[0], -1, -1, -1), mode="bilinear", padding_mode="border", align_corners=True)
         resampled_images = resampled.permute(0, 2, 3, 1).reshape(orig_shape)
         return resampled_images
+
+    def sample_random_frame(self, videos_data: torch.Tensor, batch_indices: torch.Tensor):
+        """
+        Sample a random frame from the given videos data.
+
+        Args:
+        - videos_data: torch.Tensor of shape (T, V, H, W, C)
+        - batch_indices: torch.Tensor of shape (batch_size)
+
+        Returns:
+        - batch_time: torch.Tensor of shape (1)
+        - batch_target_pixels: torch.Tensor of shape (batch_size, C)
+        """
+        frame = random.uniform(0, videos_data.shape[0] - 1)
+        frame_floor, frame_ceil, frames_alpha = int(frame), int(frame) + 1, frame - int(frame)
+        target_frame = (1 - frames_alpha) * videos_data[frame_floor] + frames_alpha * videos_data[frame_ceil]  # (V * H * W, C)
+        target_frame = target_frame.reshape(-1, 3)
+        batch_target_pixels = target_frame[batch_indices]  # (batch_size, C)
+        batch_time = torch.tensor(frame / (videos_data.shape[0] - 1), device=self.device, dtype=self.dtype)
+
+        return batch_time, batch_target_pixels
+
+    def normalize_points(self, points: torch.Tensor):
+        """
+        Normalize the points to the range [0, 1].
+
+        Args:
+        - points: torch.Tensor of shape (..., 3)
+
+        Returns:
+        - points_normalized: torch.Tensor of shape (..., 3)
+        """
+
+        scene_min = torch.tensor([-20.0, -20.0, -20.0], device=self.device, dtype=self.dtype)
+        scene_max = torch.tensor([20.0, 20.0, 20.0], device=self.device, dtype=self.dtype)
+        points_normalized = (points - scene_min) / (scene_max - scene_min)
+        return points_normalized
 
     def shuffle_uv(self, focals: torch.Tensor, width: int, height: int, randomize: bool):
         """
