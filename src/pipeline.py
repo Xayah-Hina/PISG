@@ -131,7 +131,7 @@ class PISGPipelineTorch:
                     loss_avg = loss_accum / 100.0
                     loss_avg_list.append(loss_avg)
                     loss_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {_ - 99} to {_}: {loss_avg}")
+                    tqdm.tqdm.write(f"Average loss over iterations {iter - 99} to {iter}: {loss_avg}")
 
         save_ckp_path = "final_ckp.tar"
         if save_ckp_path is not None:
