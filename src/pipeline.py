@@ -60,7 +60,7 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-    def train(self):
+    def train(self, save_ckp_path=None):
         videos_data = self.load_videos_data(*training_videos).permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
 
@@ -82,7 +82,6 @@ class PISGPipelineTorch:
 
                 rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
 
-                # optimize loss
                 loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
@@ -96,35 +95,27 @@ class PISGPipelineTorch:
                     loss_accum = 0.0
                     tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg}")
 
-        save_ckp_path = "final_ckp.tar"
         if save_ckp_path is not None:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
                 'model_state_dict': self.model.state_dict(),
-                'width': width,
-                'height': height,
-                'N_frames': 120,
             }, save_ckp_path)
 
-    def test(self):
-        output_dir = "output_pipeline"
+    def test(self, save_ckp_path, target_timestamp: int, output_dir="output"):
         import numpy as np
         import imageio.v3 as imageio
         os.makedirs(output_dir, exist_ok=True)
 
-        save_ckp_path = "final_ckp.tar"
         ckpt = torch.load(save_ckp_path)
         self.encoder.load_state_dict(ckpt['encoder_state_dict'])
         self.model.load_state_dict(ckpt['model_state_dict'])
-        width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
 
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         poses = poses[:1]
         focals = focals[:1]
 
         batch_size = 1024
-
-        test_timestamp = torch.tensor(110. / 120., device=self.device, dtype=self.dtype)
+        test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
         with torch.no_grad():
             dirs, _, _ = self.shuffle_uv(focals=focals, width=width, height=height, randomize=False)
             rgb_map_list = []
@@ -137,7 +128,7 @@ class PISGPipelineTorch:
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
-            imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
+            imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
         raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
@@ -354,5 +345,5 @@ class PISGPipelineTorch:
 
 if __name__ == '__main__':
     pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
-    pipeline.train()
-    # pipeline.test()
+    pipeline.train(save_ckp_path="ckpt.tar")
+    pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
