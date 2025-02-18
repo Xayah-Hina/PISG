@@ -54,10 +54,9 @@ class PISGPipelineTorch:
 
         self.encoder = HashEncoderNative(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
-        self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.01, betas=(0.9, 0.99))
+        self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
 
-        # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10%
-        target_lr_ratio = 0.1  # 你可以根据需求调整目标比例
+        target_lr_ratio = 0.1  # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10% 你可以根据需求调整目标比例
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
@@ -70,8 +69,8 @@ class PISGPipelineTorch:
         loss_avg_list = []
         loss_accum = 0.0
         batch_size = 1024
-        for _1 in tqdm.trange(0, 10):
-            u, v, dirs = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
+        for _1 in tqdm.trange(0, 1):
+            dirs, u, v = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
             videos_data_resampled = self.resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True)):
@@ -106,6 +105,39 @@ class PISGPipelineTorch:
                 'height': height,
                 'N_frames': 120,
             }, save_ckp_path)
+
+    def test(self):
+        output_dir = "output_pipeline"
+        import numpy as np
+        import imageio.v3 as imageio
+        os.makedirs(output_dir, exist_ok=True)
+
+        save_ckp_path = "final_ckp.tar"
+        ckpt = torch.load(save_ckp_path)
+        self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        width, height, N_frames = ckpt['width'], ckpt['height'], ckpt['N_frames']
+
+        poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        poses = poses[:1]
+        focals = focals[:1]
+
+        batch_size = 1024
+
+        test_timestamp = torch.tensor(110. / 120., device=self.device, dtype=self.dtype)
+        with torch.no_grad():
+            dirs, _, _ = self.shuffle_uv(focals=focals, width=width, height=height, randomize=False)
+            rgb_map_list = []
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False)):
+                batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
+                batch_input_xyzt_flat = torch.cat([batch_points_normalized, test_timestamp.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+
+                batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+                rgb_map_list.append(batch_rgb_map)
+            rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
+            rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+            rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
+            imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(_)), rgb8)
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
         raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
@@ -260,8 +292,9 @@ class PISGPipelineTorch:
         - randomize: bool
 
         Returns:
-        - u_normalized: torch.Tensor of shape (N, H, W)
-        - v_normalized: torch.Tensor of shape (N, H, W)
+        - dirs: torch.Tensor of shape (N, H, W, 3)
+        - u: torch.Tensor of shape (H, W)
+        - v: torch.Tensor of shape (H, W)
         """
         u, v = torch.meshgrid(torch.linspace(0, width - 1, width, device=self.device, dtype=self.dtype), torch.linspace(0, height - 1, height, device=self.device, dtype=self.dtype), indexing='xy')  # (H, W), (H, W)
         if randomize:
@@ -270,7 +303,7 @@ class PISGPipelineTorch:
         u_normalized, v_normalized = (u - width * 0.5) / focals[:, None, None], (v - height * 0.5) / focals[:, None, None]  # (N, H, W), (N, H, W)
         dirs = torch.stack([u_normalized, -v_normalized, -torch.ones_like(u_normalized)], dim=-1)  # (N, H, W, 3)
 
-        return u, v, dirs
+        return dirs, u, v
 
     def sample_frustum(self, dirs: torch.Tensor, poses: torch.Tensor, near: float, far: float, depth: int, batch_size: int, randomize: bool):
         """
@@ -298,7 +331,11 @@ class PISGPipelineTorch:
 
         depths = torch.linspace(near, far, steps=depth, device=self.device, dtype=self.dtype).unsqueeze(0)  # (1, depth)
 
-        indices = torch.randperm(num_rays, device=self.device)  # (N*H*W)
+        if randomize:
+            indices = torch.randperm(num_rays, device=self.device)  # (N*H*W)
+        else:
+            indices = torch.arange(num_rays, device=self.device)  # (N*H*W)
+
         for i in range(0, num_rays, batch_size):
             batch_indices = indices[i:i + batch_size]
             batch_rays_o = rays_o[batch_indices]  # (batch_size, 3)
@@ -318,3 +355,4 @@ class PISGPipelineTorch:
 if __name__ == '__main__':
     pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train()
+    # pipeline.test()
