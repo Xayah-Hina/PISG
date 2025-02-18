@@ -19,7 +19,7 @@ def find_relative_paths(relative_path_list):
         for directory in search_dirs:
             full_path = directory / relative_path
             if full_path.exists():
-                relative_path_list[i] = str(full_path.resolve())  # 直接修改列表中的元素
+                relative_path_list[i] = str(full_path.resolve())
                 found = True
                 break
 
@@ -46,6 +46,10 @@ find_relative_paths(camera_calibrations)
 
 
 class PISGPipelineTorch:
+    """
+    Pipeline for training and testing the PISG model using PyTorch.
+    """
+
     def __init__(self, torch_device: torch.device, torch_dtype: torch.dtype):
         self.device = torch_device
         self.dtype = torch_dtype
@@ -60,26 +64,19 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-    def train(self, save_ckp_path=None):
+    def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos).permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
 
         import tqdm
-        train_iter = 0
-        loss_avg_list = []
-        loss_accum = 0.0
-        batch_size = 1024
         for _1 in tqdm.trange(0, 1):
             dirs, u, v = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
             videos_data_resampled = self.resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True)):
-                train_iter += 1
-
                 batch_time, batch_target_pixels = self.sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices)  # (batch_size, C)
                 batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
                 batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-
                 rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
 
                 loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
@@ -87,13 +84,6 @@ class PISGPipelineTorch:
                 loss_image.backward()
                 self.optimizer.step()
                 self.scheduler.step()
-
-                loss_accum += loss_image.item()
-                if train_iter % 100 == 0 and train_iter > 0:
-                    loss_avg = loss_accum / 100.0
-                    loss_avg_list.append(loss_avg)
-                    loss_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg}")
 
         if save_ckp_path is not None:
             torch.save({
@@ -345,5 +335,5 @@ class PISGPipelineTorch:
 
 if __name__ == '__main__':
     pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
-    pipeline.train(save_ckp_path="ckpt.tar")
+    pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
     pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
