@@ -85,11 +85,12 @@ class PISGPipelineTorch:
         iter = 0
         loss_avg_list = []
         loss_accum = 0.0
+        batch_size = 1024
         for _1 in tqdm.trange(0, 10):
-            u_normalized, v_normalized = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
-            videos_data_resampled = self.resample_frames(frames=videos_data, u=u_normalized, v=v_normalized)  # (T, V, H, W, C)
+            u, v, dirs = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
+            videos_data_resampled = self.resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(u_normalized=u_normalized, v_normalized=v_normalized, poses=poses, near=near, far=far, depth=32, batch_size=batch_size, randomize=True)):
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=32, batch_size=batch_size, randomize=True)):
                 iter += 1
 
                 frame = random.uniform(0, videos_data_resampled.shape[0] - 1)
@@ -256,16 +257,16 @@ class PISGPipelineTorch:
             du, dv = torch.rand_like(u), torch.rand_like(v)  # (H, W), (H, W)
             u, v = torch.clip(u + du, 0, width - 1), torch.clip(v + dv, 0, height - 1)  # (H, W), (H, W)
         u_normalized, v_normalized = (u - width * 0.5) / focals[:, None, None], (v - height * 0.5) / focals[:, None, None]  # (N, H, W), (N, H, W)
+        dirs = torch.stack([u_normalized, -v_normalized, -torch.ones_like(u_normalized)], dim=-1)  # (N, H, W, 3)
 
-        return u_normalized, v_normalized
+        return u, v, dirs
 
-    def sample_frustum(self, u_normalized, v_normalized, poses: torch.Tensor, near: float, far: float, depth: int, batch_size: int, randomize: bool):
+    def sample_frustum(self, dirs: torch.Tensor, poses: torch.Tensor, near: float, far: float, depth: int, batch_size: int, randomize: bool):
         """
         Sample points in the frustum of each camera.
 
         Args:
-        - u_normalized: torch.Tensor of shape (N, H, W)
-        - v_normalized: torch.Tensor of shape (N, H, W)
+        - dirs: torch.Tensor of shape (N, H, W, 3)
         - poses: torch.Tensor of shape (N, 4, 4)
         - near: float
         - far: float
@@ -277,7 +278,6 @@ class PISGPipelineTorch:
         - points: torch.Tensor of shape (batch_size, depth, 3)
         """
 
-        dirs = torch.stack([u_normalized, -v_normalized, -torch.ones_like(u_normalized)], dim=-1)  # (N, H, W, 3)
         rays_d = torch.einsum('nij,nhwj->nhwi', poses[:, :3, :3], dirs)  # (N, H, W, 3)
         rays_o = poses[:, None, None, :3, 3].expand(rays_d.shape)  # (N, H, W, 3)
 
