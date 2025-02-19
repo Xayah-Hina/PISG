@@ -73,7 +73,11 @@ class PISGPipelineTorch:
             dirs, u, v = self.shuffle_uv(focals=focals, width=width, height=height, randomize=True)
             videos_data_resampled = self.resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True)):
+            # for _2, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True)):
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(
+                    tqdm.tqdm(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth,
+                                             batch_size=batch_size, randomize=True), desc="Frustum Sampling")
+            ):
                 batch_time, batch_target_pixels = self.sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices)  # (batch_size, C)
                 batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
                 batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
