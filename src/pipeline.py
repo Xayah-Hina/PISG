@@ -368,7 +368,7 @@ def test_pipeline(rank, gpu_size):
     pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
 
     for _ in range(120):
-        if _ % 10 == rank:
+        if _ % 2 == rank:
             pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=_)
 
 
