@@ -122,7 +122,7 @@ class PISGPipelineTorch:
             rgb_map_list = []
             for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False), desc="Rendering Frame")):
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
-                rgb_map_list.append(batch_rgb_map)
+                rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
