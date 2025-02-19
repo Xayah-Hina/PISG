@@ -1,5 +1,6 @@
 import torch
 import torchvision.io as io
+import torch.multiprocessing as mp
 import os
 import math
 import random
@@ -360,8 +361,30 @@ class PISGPipelineTorch:
             yield batch_points, batch_depths, batch_indices
 
 
-if __name__ == '__main__':
-    torch.set_float32_matmul_precision('high')
+def test_pipeline(rank, gpu_size):
+    device = torch.device(f"cuda:{rank % gpu_size}")
+    print(f"Process {rank} running on {device}")
+
+    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
+
+    for _ in range(120):
+        if _ % 10 == rank:
+            pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=_)
+
+
+def test():
+    gpu_size = torch.cuda.device_count()
+    print(f"Launching {gpu_size} processes for GPU tasks.")
+    mp.spawn(test_pipeline, args=(gpu_size,), nprocs=gpu_size, join=True)
+
+
+def train():
     pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
-    pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
+
+
+if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
+
+    train()
+    # test()
