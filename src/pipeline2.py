@@ -229,16 +229,16 @@ class PISGPipelineVelTorch:
         def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-
-            jac_final = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
-            return batch_rgb_map, jac_final
+            batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+            return batch_rgb_map, raw_d, d_x, d_y, d_z, d_t
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
     def calculate_jacobian(self, xyzt: torch.Tensor, chunk_size: int):
-
-        jac_list = []
+        d_x_list = []
+        d_y_list = []
+        d_z_list = []
+        d_t_list = []
         for i in range(0, xyzt.shape[0], chunk_size):
             xyzt_chunk = xyzt[i:i + chunk_size]
             xyzt_chunk.requires_grad = True
@@ -250,11 +250,17 @@ class PISGPipelineVelTorch:
             jac = torch.vmap(torch.func.jacrev(g))(h)
             jac_x = _get_minibatch_jacobian(h, xyzt_chunk)
             jac = jac @ jac_x
-            # _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
-            jac_list.append(jac)
-        jac_final = torch.cat(jac_list, dim=0)
+            _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
+            d_x_list.append(_d_x)
+            d_y_list.append(_d_y)
+            d_z_list.append(_d_z)
+            d_t_list.append(_d_t)
+        d_x_final = torch.cat(d_x_list, dim=0)
+        d_y_final = torch.cat(d_y_list, dim=0)
+        d_z_final = torch.cat(d_z_list, dim=0)
+        d_t_final = torch.cat(d_t_list, dim=0)
 
-        return jac_final
+        return d_x_final, d_y_final, d_z_final, d_t_final
 
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)
@@ -270,7 +276,7 @@ class PISGPipelineVelTorch:
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map, jac_final = self.compiled_forward(batch_points, batch_depths, batch_time)
+                batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.compiled_forward(batch_points, batch_depths, batch_time)
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
@@ -305,7 +311,7 @@ class PISGPipelineVelTorch:
             rgb_map_list = []
             for _1, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
-                batch_rgb_map, jac_final = self.compiled_forward(batch_points, batch_depths, test_timestamp)
+                batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
@@ -313,14 +319,15 @@ class PISGPipelineVelTorch:
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
-        raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
-        raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
+        raw_d_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
+        raw_d = raw_d_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
-        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
+        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw_d[..., -1]) * batch_depths)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
         rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
 
-        return rgb_map
+        d_x, d_y, d_z, d_t = self.calculate_jacobian(xyzt=xyzt, chunk_size=1024 * 64)
+        return rgb_map, raw_d, d_x, d_y, d_z, d_t
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
