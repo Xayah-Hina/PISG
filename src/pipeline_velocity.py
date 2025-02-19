@@ -91,10 +91,12 @@ class PISGVelocityPipelineTorch:
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
     def train(self, batch_size, save_ckp_path):
-        videos_data = self.load_videos_data(*training_videos).permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
-        videos_data = self.resample_images_by_ratio_device(videos_data, 0.5)
+        videos_data = self.load_videos_data(*training_videos)
+        videos_data = self.resample_images_by_ratio_device(videos_data, self.ratio)
         videos_data = videos_data.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        width = width * self.ratio
+        height = height * self.ratio
 
         import tqdm
         for _1 in tqdm.trange(0, 1):
