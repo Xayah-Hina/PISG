@@ -443,8 +443,15 @@ def train():
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
 
 
+def test_jac():
+    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+    jac_final = pipeline.calculate_jacobian(torch.rand(1024 * 64, 4), 1024)
+    print(jac_final.shape)
+
+
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    train()
+    # train()
     # test()
+    test_jac()
