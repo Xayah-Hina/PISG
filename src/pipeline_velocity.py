@@ -107,7 +107,6 @@ class PISGVelocityPipelineTorch:
 
                 j1 = self.query_rgb_map_with_grad1(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
                 j2 = self.query_rgb_map_with_grad2(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-                torch.allclose(j1, j2, atol=1e-2)
 
 
                 loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
@@ -166,6 +165,8 @@ class PISGVelocityPipelineTorch:
         def g(x):
             return self.model(x)
 
+        xyzt.requires_grad = True
+
         h = self.encoder(xyzt)
         raw_d = self.model(h)
         jac = torch.vmap(torch.func.jacrev(g))(h)
@@ -173,14 +174,21 @@ class PISGVelocityPipelineTorch:
         jac = jac @ jac_x
         _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
 
+        print(f"raw_d: {raw_d.shape}, jac: {jac.shape}, _d_x: {_d_x.shape}, _d_y: {_d_y.shape}, _d_z: {_d_z.shape}, _d_t: {_d_t.shape}")
+
         return jac
 
     def query_rgb_map_with_grad2(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
+
+        xyzt.requires_grad = True
+
         def F(x):
             h = self.encoder(x)
             return self.model(h)
 
         jacobian_F = torch.vmap(torch.func.jacrev(F))(xyzt)
+
+        print(f"jacobian_F: {jacobian_F.shape}")
 
         return jacobian_F
 
