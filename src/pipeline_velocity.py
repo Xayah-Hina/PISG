@@ -45,7 +45,33 @@ find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
 
 
-class PISGPipelineTorch:
+def _get_minibatch_jacobian(y, x):
+    """Computes the Jacobian of y wrt x assuming minibatch-mode.
+    Args:
+      y: (N, ...) with a total of D_y elements in ...
+      x: (N, ...) with a total of D_x elements in ...
+    Returns:
+      The minibatch Jacobian matrix of shape (N, D_y, D_x)
+    """
+    assert y.shape[0] == x.shape[0]
+    y = y.view(y.shape[0], -1)
+    # Compute Jacobian row by row.
+    jac = []
+    for j in range(y.shape[1]):
+        dy_j_dx = torch.autograd.grad(
+            y[:, j],
+            x,
+            torch.ones_like(y[:, j], device=y.get_device()),
+            retain_graph=True,
+            create_graph=True,
+        )[0].view(x.shape[0], -1)
+
+        jac.append(torch.unsqueeze(dy_j_dx, 1))
+    jac = torch.cat(jac, 1)
+    return jac
+
+
+class PISGVelocityPipelineTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
     """
@@ -78,6 +104,11 @@ class PISGPipelineTorch:
                 batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
                 batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
                 rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+
+                j1 = self.query_rgb_map_with_grad1(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+                j2 = self.query_rgb_map_with_grad2(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+                torch.allclose(j1, j2, atol=1e-2)
+
 
                 loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
@@ -129,6 +160,29 @@ class PISGPipelineTorch:
         rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
 
         return rgb_map
+
+    def query_rgb_map_with_grad1(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
+
+        def g(x):
+            return self.model(x)
+
+        h = self.encoder(xyzt)
+        raw_d = self.model(h)
+        jac = torch.vmap(torch.func.jacrev(g))(h)
+        jac_x = _get_minibatch_jacobian(h, xyzt)
+        jac = jac @ jac_x
+        _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
+
+        return jac
+
+    def query_rgb_map_with_grad2(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
+        def F(x):
+            h = self.encoder(x)
+            return self.model(h)
+
+        jacobian_F = torch.vmap(torch.func.jacrev(F))(xyzt)
+
+        return jacobian_F
 
     def load_videos_data(self, *video_paths):
         """
@@ -334,6 +388,6 @@ class PISGPipelineTorch:
 
 
 if __name__ == '__main__':
-    pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+    pipeline = PISGVelocityPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
-    pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
+    # pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
