@@ -116,10 +116,11 @@ class PISGPipelineTorch:
 
         batch_size = 1024
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
+        import tqdm
         with torch.no_grad():
             dirs, _, _ = self.shuffle_uv(focals=focals, width=width, height=height, randomize=False)
             rgb_map_list = []
-            for _1, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False)):
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False), desc="Rendering Frame")):
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map)
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
