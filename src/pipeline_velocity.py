@@ -92,6 +92,8 @@ class PISGVelocityPipelineTorch:
 
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos).permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
+        videos_data = self.resample_images_by_ratio_device(videos_data, 0.5)
+        videos_data = videos_data.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
 
         import tqdm
@@ -187,8 +189,9 @@ class PISGVelocityPipelineTorch:
             return self.model(h)
 
         jacobian_F = torch.vmap(torch.func.jacrev(F))(xyzt)
+        _d_x, _d_y, _d_z, _d_t = [torch.squeeze(torch.squeeze(_, -1), -1) for _ in jacobian_F.split(1, dim=-1)]
 
-        print(f"jacobian_F: {jacobian_F.shape}")
+        print(f"jacobian_F: {jacobian_F.shape}, _d_x: {_d_x.shape}, _d_y: {_d_y.shape}, _d_z: {_d_z.shape}, _d_t: {_d_t.shape}")
 
         return jacobian_F
 
@@ -264,6 +267,25 @@ class PISGVelocityPipelineTorch:
         focals = torch.tensor([info["focal"] * widths[0] / info["aperture"] for info in camera_infos], device=self.device, dtype=self.dtype)
 
         return poses, focals, widths[0], heights[0], nears[0], fars[0]
+
+    def resample_images_by_ratio_device(self, images: torch.Tensor, ratio: float):
+        """
+        resample images by ratio
+
+        Args:
+        - images: torch.Tensor of shape (V, T, H, W, C)
+        - ratio: float, resampling ratio
+
+        Returns:
+        - torch.Tensor of shape (V, T, H * ratio, W * ratio, C)
+
+        """
+        V, T, H, W, C = images.shape
+        images_permuted = images.permute(0, 1, 4, 2, 3).reshape(V * T, C, H, W)  # (V * T, C, H, W)
+        images_permuted_resized = (torch.nn.functional.interpolate(images_permuted, size=(int(H * ratio), int(W * ratio)), mode='bilinear', align_corners=False)
+                                   .reshape(V, T, C, int(H * ratio), int(W * ratio))
+                                   .permute(0, 1, 3, 4, 2))  # (V, T, H * ratio, W * ratio, C)
+        return images_permuted_resized
 
     def resample_frames(self, frames: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
         """
