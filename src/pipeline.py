@@ -46,26 +46,6 @@ find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
 
 
-def resample_images_by_ratio_device(images: torch.Tensor, ratio: float):
-    """
-    resample images by ratio
-
-    Args:
-    - images: torch.Tensor of shape (V, T, H, W, C)
-    - ratio: float, resampling ratio
-
-    Returns:
-    - torch.Tensor of shape (V, T, H * ratio, W * ratio, C)
-
-    """
-    V, T, H, W, C = images.shape
-    images_permuted = images.permute(0, 1, 4, 2, 3).reshape(V * T, C, H, W)  # (V * T, C, H, W)
-    images_permuted_resized = (torch.nn.functional.interpolate(images_permuted, size=(int(H * ratio), int(W * ratio)), mode='bilinear', align_corners=False)
-                               .reshape(V, T, C, int(H * ratio), int(W * ratio))
-                               .permute(0, 1, 3, 4, 2))  # (V, T, H * ratio, W * ratio, C)
-    return images_permuted_resized
-
-
 def resample_frames(frames: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
     """
     Resample frames using the given UV coordinates.
@@ -229,9 +209,7 @@ class PISGPipelineTorch:
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
-        videos_data = self.load_videos_data(*training_videos)
-        videos_data = resample_images_by_ratio_device(videos_data, self.ratio)
-        videos_data = videos_data.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
+        videos_data = self.load_videos_data(*training_videos, ratio=self.ratio) # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         width = int(width * self.ratio)
         height = int(height * self.ratio)
@@ -295,15 +273,15 @@ class PISGPipelineTorch:
 
         return rgb_map
 
-    def load_videos_data(self, *video_paths):
+    def load_videos_data(self, *video_paths, ratio: float):
         """
-        Load multiple videos directly from given paths onto the specified device.
+        Load multiple videos directly from given paths onto the specified device, resample images by ratio.
 
         Args:
         - *paths: str (arbitrary number of video file paths)
 
         Returns:
-        - torch.Tensor of shape (V, T, H, W, C)
+        - torch.Tensor of shape (T, V, H * ratio, W * ratio, C)
         """
 
         if not video_paths:
@@ -320,12 +298,21 @@ class PISGPipelineTorch:
         for _path in valid_paths:
             try:
                 _frames, _, _ = io.read_video(_path, pts_unit="sec")
-                _frames = _frames.to(self.device, dtype=self.dtype) / 255.0
+                _frames = _frames.to(dtype=self.dtype) / 255.0
                 _frames_tensors.append(_frames)
             except Exception as e:
                 print(f"Error loading video '{_path}': {e}")
 
-        return torch.stack(_frames_tensors)
+        videos = torch.stack(_frames_tensors)
+
+        V, T, H, W, C = videos.shape
+        videos_permuted = videos.permute(0, 1, 4, 2, 3).reshape(V * T, C, H, W)
+        new_H, new_W = int(H * ratio), int(W * ratio)
+        videos_resampled = torch.nn.functional.interpolate(videos_permuted, size=(new_H, new_W), mode='bilinear', align_corners=False)
+        videos_resampled = videos_resampled.reshape(V, T, C, new_H, new_W).permute(1, 0, 3, 4, 2)
+        videos_resampled = videos_resampled.to(self.device)
+
+        return videos_resampled
 
     def load_cameras_data(self, *cameras_paths):
         """
