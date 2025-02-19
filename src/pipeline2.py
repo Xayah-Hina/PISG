@@ -46,6 +46,32 @@ find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
 
 
+def _get_minibatch_jacobian(y, x):
+    """Computes the Jacobian of y wrt x assuming minibatch-mode.
+    Args:
+      y: (N, ...) with a total of D_y elements in ...
+      x: (N, ...) with a total of D_x elements in ...
+    Returns:
+      The minibatch Jacobian matrix of shape (N, D_y, D_x)
+    """
+    assert y.shape[0] == x.shape[0]
+    y = y.view(y.shape[0], -1)
+    # Compute Jacobian row by row.
+    jac = []
+    for j in range(y.shape[1]):
+        dy_j_dx = torch.autograd.grad(
+            y[:, j],
+            x,
+            torch.ones_like(y[:, j], device=y.get_device()),
+            retain_graph=True,
+            create_graph=True,
+        )[0].view(x.shape[0], -1)
+
+        jac.append(torch.unsqueeze(dy_j_dx, 1))
+    jac = torch.cat(jac, 1)
+    return jac
+
+
 def resample_images_by_ratio_device(images: torch.Tensor, ratio: float):
     """
     resample images by ratio
@@ -200,7 +226,7 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     return dirs, u, v
 
 
-class PISGPipelineTorch:
+class PISGPipelineVelTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
     """
@@ -228,6 +254,26 @@ class PISGPipelineTorch:
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
+    def calculate_jacobian(self, xyzt: torch.Tensor, chunk_size: int):
+
+        jac_list = []
+        for i in range(0, xyzt.shape[0], chunk_size):
+            xyzt_chunk = xyzt[i:i + chunk_size]
+            xyzt_chunk.requires_grad = True
+
+            def g(x):
+                return self.model(x)
+
+            h = self.encoder(xyzt_chunk)
+            jac = torch.vmap(torch.func.jacrev(g))(h)
+            jac_x = _get_minibatch_jacobian(h, xyzt_chunk)
+            jac = jac @ jac_x
+            # _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
+            jac_list.append(jac)
+        jac_final = torch.cat(jac_list, dim=0)
+
+        return jac_final
+
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos)
         videos_data = resample_images_by_ratio_device(videos_data, self.ratio)
@@ -245,6 +291,12 @@ class PISGPipelineTorch:
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
+
+                batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
+                batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+                jac_final = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
+                print(jac_final.shape)
+
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
@@ -373,7 +425,7 @@ def test_pipeline(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
-    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
+    pipeline = PISGPipelineVelTorch(torch_device=device, torch_dtype=torch.float32)
 
     for _ in range(120):
         if _ % 2 == rank:
@@ -387,7 +439,7 @@ def test():
 
 
 def train():
-    pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
 
 
