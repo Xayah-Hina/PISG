@@ -65,8 +65,11 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-        def PISG_forward(xyzt: torch.Tensor):
-            return self.model(self.encoder(xyzt))
+        def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
+            batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
+            batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+            batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+            return batch_rgb_map
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
@@ -85,11 +88,8 @@ class PISGPipelineTorch:
 
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = self.sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices)  # (batch_size, C)
-                batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
-                batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-                rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-
-                loss_image = torch.nn.functional.mse_loss(rgb_map, batch_target_pixels)
+                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
+                loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
                 self.optimizer.step()
@@ -120,10 +120,7 @@ class PISGPipelineTorch:
             dirs, _, _ = self.shuffle_uv(focals=focals, width=width, height=height, randomize=False)
             rgb_map_list = []
             for _1, (batch_points, batch_depths, batch_indices) in enumerate(self.sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False)):
-                batch_points_normalized = self.normalize_points(points=batch_points)  # (batch_size, depth, 3)
-                batch_input_xyzt_flat = torch.cat([batch_points_normalized, test_timestamp.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-
-                batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map)
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
@@ -131,7 +128,7 @@ class PISGPipelineTorch:
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
-        raw_flat = self.compiled_forward(xyzt)  # (batch_size * depth, 4)
+        raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
         raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
         alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
