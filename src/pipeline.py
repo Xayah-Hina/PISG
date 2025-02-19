@@ -70,8 +70,8 @@ class PISGPipelineTorch:
         videos_data = self.resample_images_by_ratio_device(videos_data, self.ratio)
         videos_data = videos_data.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        width = width * self.ratio
-        height = height * self.ratio
+        width = int(width * self.ratio)
+        height = int(height * self.ratio)
 
         import tqdm
         for _1 in tqdm.trange(0, 1):

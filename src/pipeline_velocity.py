@@ -81,6 +81,7 @@ class PISGVelocityPipelineTorch:
         self.dtype = torch_dtype
         self.encoder_num_scale = 16
         self.depth = 192
+        self.ratio = 0.5
 
         self.encoder = HashEncoderNative(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
@@ -95,8 +96,8 @@ class PISGVelocityPipelineTorch:
         videos_data = self.resample_images_by_ratio_device(videos_data, self.ratio)
         videos_data = videos_data.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        width = width * self.ratio
-        height = height * self.ratio
+        width = int(width * self.ratio)
+        height = int(height * self.ratio)
 
         import tqdm
         for _1 in tqdm.trange(0, 1):
