@@ -55,7 +55,7 @@ class PISGPipelineTorch:
         self.dtype = torch_dtype
         self.encoder_num_scale = 16
         self.depth = 192
-        self.ratio = 0.5
+        self.ratio = 1.0
 
         self.encoder = HashEncoderNative(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
@@ -64,6 +64,11 @@ class PISGPipelineTorch:
         target_lr_ratio = 0.1  # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10% 你可以根据需求调整目标比例
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+
+        def PISG_forward(xyzt: torch.Tensor):
+            return self.model(self.encoder(xyzt))
+
+        self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos)
@@ -126,7 +131,7 @@ class PISGPipelineTorch:
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
-        raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
+        raw_flat = self.compiled_forward(xyzt)  # (batch_size * depth, 4)
         raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
         alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
@@ -358,6 +363,7 @@ class PISGPipelineTorch:
 
 
 if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
     pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
     pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=112)
