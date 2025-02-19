@@ -230,7 +230,9 @@ class PISGPipelineVelTorch:
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
             batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-            return batch_rgb_map
+
+            jac_final = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
+            return batch_rgb_map, jac_final
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
@@ -268,12 +270,7 @@ class PISGPipelineVelTorch:
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
-
-                batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
-                batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-                jac_final = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
-                print(jac_final.shape)
+                batch_rgb_map, jac_final = self.compiled_forward(batch_points, batch_depths, batch_time)
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
@@ -308,7 +305,7 @@ class PISGPipelineVelTorch:
             rgb_map_list = []
             for _1, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
-                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
+                batch_rgb_map, jac_final = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
