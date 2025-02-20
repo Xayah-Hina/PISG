@@ -317,6 +317,8 @@ class PISGPipelineVelTorch:
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         poses = poses[:1]
         focals = focals[:1]
+        width = int(width * self.ratio)
+        height = int(height * self.ratio)
 
         batch_size = 1024
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
