@@ -72,6 +72,43 @@ def _get_minibatch_jacobian(y, x):
     return jac
 
 
+def PDE_EQs(D_t, D_x, D_y, D_z, U, F, U_t=None, U_x=None, U_y=None, U_z=None, detach=False):
+    eqs = []
+    dts = [D_t]
+    dxs = [D_x]
+    dys = [D_y]
+    dzs = [D_z]
+
+    F = torch.cat([torch.zeros_like(F[:, :1]), F], dim=1) * 0  # (N,4)
+    u, v, w = U.split(1, dim=-1)  # (N,1)
+    F_t, F_x, F_y, F_z = F.split(1, dim=-1)  # (N,1)
+    dfs = [F_t, F_x, F_y, F_z]
+
+    if None not in [U_t, U_x, U_y, U_z]:
+        dts += U_t.split(1, dim=-1)  # [d_t, u_t, v_t, w_t] # (N,1)
+        dxs += U_x.split(1, dim=-1)  # [d_x, u_x, v_x, w_x]
+        dys += U_y.split(1, dim=-1)  # [d_y, u_y, v_y, w_y]
+        dzs += U_z.split(1, dim=-1)  # [d_z, u_z, v_z, w_z]
+    else:
+        dfs = [F_t]
+
+    for i, (dt, dx, dy, dz, df) in enumerate(zip(dts, dxs, dys, dzs, dfs)):
+        if i == 0:
+            _e = dt + (u * dx + v * dy + w * dz) + df
+        else:
+            if detach:
+                _e = dt + (u.detach() * dx + v.detach() * dy + w.detach() * dz) + df
+            else:
+                _e = dt + (u * dx + v * dy + w * dz) + df
+        eqs += [_e]
+
+    if None not in [U_t, U_x, U_y, U_z]:
+        # eqs += [ u_x + v_y + w_z ]
+        eqs += [dxs[1] + dys[2] + dzs[3]]
+
+    return eqs
+
+
 def resample_frames(frames: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
     """
     Resample frames using the given UV coordinates.
@@ -235,7 +272,15 @@ class PISGPipelineVelTorch:
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
             batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
             d_x, d_y, d_z, d_t = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
-            return batch_rgb_map, raw_d, d_x, d_y, d_z, d_t
+            raw_vel, raw_f = self.query_velocity(xyzt=batch_input_xyzt_flat)
+            _u_x, _u_y, _u_z, _u_t = None, None, None, None
+            split_nse = PDE_EQs(d_t, d_x, d_y, d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
+            nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
+            split_nse_wei = [0.001]
+            nseloss_fine = 0.0
+            for ei, wi in zip(nse_errors, split_nse_wei):
+                nseloss_fine = ei * wi + nseloss_fine
+            return batch_rgb_map, raw_d, nseloss_fine
 
         def PISG_forward_test(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
@@ -275,12 +320,20 @@ class PISGPipelineVelTorch:
         return d_x_final, d_y_final, d_z_final, d_t_final
 
     def train(self, batch_size, save_ckp_path):
+
+        if save_ckp_path is not None:
+            ckpt = torch.load(save_ckp_path)
+            self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+            self.model.load_state_dict(ckpt['model_state_dict'])
+
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        width = int(width * self.ratio)
-        height = int(height * self.ratio)
+        width, height = int(width * self.ratio), int(height * self.ratio)
 
         import tqdm
+        train_iter = 0
+        loss_avg_list, loss_v_avg_list, loss_all_avg_list = [], [], []
+        loss_accum, loss_v_accum, loss_all_accum = 0.0, 0.0, 0.0
         for _1 in tqdm.trange(0, 1):
             dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
@@ -288,21 +341,41 @@ class PISGPipelineVelTorch:
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.compiled_forward(batch_points, batch_depths, batch_time)
+                batch_rgb_map, raw_d, nseloss_fine = self.compiled_forward(batch_points, batch_depths, batch_time)
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
+                loss_vel = nseloss_fine
+                loss = loss_image + loss_vel
                 self.optimizer.zero_grad()
                 self.optimizer_v.zero_grad()
-                loss_image.backward()
+                loss.backward()
                 self.optimizer.step()
                 self.optimizer_v.step()
                 self.scheduler.step()
                 self.scheduler_v.step()
 
+                train_iter += 1
+                loss_accum += loss_image.item()
+                loss_v_accum += loss_vel.item()
+                loss_all_accum += loss.item()
+                if train_iter % 100 == 0:
+                    loss_avg = loss_accum / 100.0
+                    loss_v_avg = loss_v_accum / 100.0
+                    loss_all_avg = loss_all_accum / 100.0
+                    loss_avg_list.append(loss_avg)
+                    loss_v_avg_list.append(loss_v_avg)
+                    loss_all_avg_list.append(loss_all_avg)
+                    loss_accum = 0.0
+                    loss_v_accum = 0.0
+                    loss_all_accum = 0.0
+                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.4f}, {loss_v_avg:.4f}, {loss_all_avg:.4f}")
+
         if save_ckp_path is not None:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
                 'model_state_dict': self.model.state_dict(),
+                'encoder_v_state_dict': self.encoder_v.state_dict(),
+                'model_v_state_dict': self.model_v.state_dict(),
             }, save_ckp_path)
 
     def test(self, save_ckp_path, target_timestamp: int, output_dir="output"):
@@ -315,10 +388,7 @@ class PISGPipelineVelTorch:
         self.model.load_state_dict(ckpt['model_state_dict'])
 
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        poses = poses[:1]
-        focals = focals[:1]
-        width = int(width * self.ratio)
-        height = int(height * self.ratio)
+        poses, focals, width, height = poses[:1], focals[:1], int(width * self.ratio), int(height * self.ratio)
 
         batch_size = 1024
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
@@ -343,6 +413,10 @@ class PISGPipelineVelTorch:
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
         rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
         return rgb_map, raw_d
+
+    def query_velocity(self, xyzt: torch.Tensor):
+        raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(xyzt))  # (batch_size * depth, 4)
+        return raw_v_flat, raw_f_flat
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
