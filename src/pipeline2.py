@@ -277,7 +277,7 @@ class PISGPipelineVelTorch:
             def func(xyzt):
                 return self.model(self.encoder(xyzt))
 
-            jacobian = vmap(jacrev(func))(batch_points)
+            jacobian = vmap(jacrev(func))(batch_input_xyzt_flat)
             jacobian = jacobian.squeeze(1).squeeze(1)
             _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
             _u_x, _u_y, _u_z, _u_t = None, None, None, None
