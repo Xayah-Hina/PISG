@@ -273,7 +273,22 @@ class PISGPipelineVelTorch:
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
             batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
             raw_vel, raw_f = self.query_velocity(xyzt=batch_input_xyzt_flat)
-            return batch_rgb_map, raw_d, raw_vel, raw_f
+
+            def func(xyzt):
+                return self.model(self.encoder(xyzt))
+
+            jacobian = vmap(jacrev(func))(batch_points)
+            jacobian = jacobian.squeeze(1).squeeze(1)
+            _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
+            _u_x, _u_y, _u_z, _u_t = None, None, None, None
+            split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
+            nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
+            split_nse_wei = [0.001]
+            nseloss_fine = 0.0
+            for ei, wi in zip(nse_errors, split_nse_wei):
+                nseloss_fine = ei * wi + nseloss_fine
+
+            return batch_rgb_map, raw_d, nseloss_fine
 
         def PISG_forward_test(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
@@ -306,21 +321,8 @@ class PISGPipelineVelTorch:
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map, raw_d, raw_vel, raw_f = self.compiled_forward(batch_points, batch_depths, batch_time)
+                batch_rgb_map, raw_d, nseloss_fine = self.compiled_forward(batch_points, batch_depths, batch_time)
 
-                def func(xyzt):
-                    return self.model(self.encoder(xyzt))
-
-                jacobian = vmap(jacrev(func))(batch_points)
-                jacobian = jacobian.squeeze(1).squeeze(1)
-                _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
-                _u_x, _u_y, _u_z, _u_t = None, None, None, None
-                split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
-                nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
-                split_nse_wei = [0.001]
-                nseloss_fine = 0.0
-                for ei, wi in zip(nse_errors, split_nse_wei):
-                    nseloss_fine = ei * wi + nseloss_fine
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 loss_vel = nseloss_fine
