@@ -6,7 +6,7 @@ import math
 import random
 from pathlib import Path
 
-from model.model_hyfluid import NeRFSmall
+from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
 from model.encoder_hyfluid import HashEncoderNative
 
 
@@ -218,21 +218,33 @@ class PISGPipelineVelTorch:
         self.depth = 192
         self.ratio = 1.0
 
-        self.encoder = HashEncoderNative(device=self.device).to(self.device)
+        self.encoder = HashEncoderNative(max_res=256, device=self.device).to(self.device)
+        self.encoder_v = HashEncoderNative(max_res=128, device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
+        self.model_v = NeRFSmallPotential(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2, use_f=False).to(self.device)
         self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
+        self.optimizer_v = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.005, betas=(0.9, 0.99))
 
         target_lr_ratio = 0.1  # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10% 你可以根据需求调整目标比例
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+        self.scheduler_v = torch.optim.lr_scheduler.ExponentialLR(self.optimizer_v, gamma=gamma)
 
         def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+            batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+            d_x, d_y, d_z, d_t = self.calculate_jacobian(xyzt=batch_input_xyzt_flat, chunk_size=1024 * 64)
             return batch_rgb_map, raw_d, d_x, d_y, d_z, d_t
 
+        def PISG_forward_test(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
+            batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
+            batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+            batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+            return batch_rgb_map, raw_d
+
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
+        self.compiled_forward_test = torch.compile(PISG_forward_test, mode="max-autotune")
 
     def calculate_jacobian(self, xyzt: torch.Tensor, chunk_size: int):
         d_x_list = []
@@ -280,9 +292,12 @@ class PISGPipelineVelTorch:
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
+                self.optimizer_v.zero_grad()
                 loss_image.backward()
                 self.optimizer.step()
+                self.optimizer_v.step()
                 self.scheduler.step()
+                self.scheduler_v.step()
 
         if save_ckp_path is not None:
             torch.save({
@@ -311,7 +326,7 @@ class PISGPipelineVelTorch:
             rgb_map_list = []
             for _1, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
-                batch_rgb_map, raw_d, d_x, d_y, d_z, d_t = self.compiled_forward(batch_points, batch_depths, test_timestamp)
+                batch_rgb_map, _ = self.compiled_forward_test(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
@@ -325,9 +340,7 @@ class PISGPipelineVelTorch:
         alpha = 1. - torch.exp(-torch.nn.functional.relu(raw_d[..., -1]) * batch_depths)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
         rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
-
-        d_x, d_y, d_z, d_t = self.calculate_jacobian(xyzt=xyzt, chunk_size=1024 * 64)
-        return rgb_map, raw_d, d_x, d_y, d_z, d_t
+        return rgb_map, raw_d
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
