@@ -524,11 +524,32 @@ def train():
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
 
 
-if __name__ == '__main__':
-    torch.set_float32_matmul_precision('high')
+# if __name__ == '__main__':
+#     torch.set_float32_matmul_precision('high')
+#
+#     train()
+#     # test()
 
-    train()
-    # test()
+
+
+if __name__ == '__main__':
+    device = torch.device("cuda")
+    encoder = HashEncoderNative(max_res=256, device=device).to(device)
+    model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=16 * 2).to(device)
+
+    input_tensor = torch.rand(256 * 192, 4, device=torch.device("cuda"), dtype=torch.float32)
+    input_tensor.requires_grad = True
+
+    def g(x):
+        return model(x)
+
+    h = encoder(input_tensor)
+    jac = torch.vmap(torch.func.jacrev(g))(h)
+    jac_x = _get_minibatch_jacobian(h, input_tensor)
+
+    print(f'jac shape: {jac.shape}')
+
+
 
 # def test_jac(chunk_size):
 #     import time
