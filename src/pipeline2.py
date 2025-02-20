@@ -4,6 +4,7 @@ import torch.multiprocessing as mp
 import os
 import math
 import random
+from torch.func import jacrev, vmap
 from pathlib import Path
 
 from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
@@ -283,34 +284,6 @@ class PISGPipelineVelTorch:
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
         self.compiled_forward_test = torch.compile(PISG_forward_test, mode="max-autotune")
 
-    def calculate_jacobian(self, xyzt: torch.Tensor, chunk_size: int):
-        d_x_list = []
-        d_y_list = []
-        d_z_list = []
-        d_t_list = []
-        for i in range(0, xyzt.shape[0], chunk_size):
-            xyzt_chunk = xyzt[i:i + chunk_size]
-            xyzt_chunk.requires_grad = True
-
-            def g(x):
-                return self.model(x)
-
-            h = self.encoder(xyzt_chunk)
-            jac = torch.vmap(torch.func.jacrev(g))(h)
-            jac_x = _get_minibatch_jacobian(h, xyzt_chunk)
-            jac = jac @ jac_x
-            _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
-            d_x_list.append(_d_x)
-            d_y_list.append(_d_y)
-            d_z_list.append(_d_z)
-            d_t_list.append(_d_t)
-        d_x_final = torch.cat(d_x_list, dim=0)
-        d_y_final = torch.cat(d_y_list, dim=0)
-        d_z_final = torch.cat(d_z_list, dim=0)
-        d_t_final = torch.cat(d_t_list, dim=0)
-
-        return d_x_final, d_y_final, d_z_final, d_t_final
-
     def train(self, batch_size, save_ckp_path):
 
         if save_ckp_path is not None:
@@ -335,7 +308,12 @@ class PISGPipelineVelTorch:
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map, raw_d, raw_vel, raw_f = self.compiled_forward(batch_points, batch_depths, batch_time)
 
-                _d_x, _d_y, _d_z, _d_t = self.calculate_jacobian(xyzt=batch_points, chunk_size=1024 * 64)
+                def func(xyzt):
+                    return self.model(self.encoder(xyzt))
+
+                jacobian = vmap(jacrev(func))(batch_points)
+                jacobian = jacobian.squeeze(1).squeeze(1)
+                _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
                 _u_x, _u_y, _u_z, _u_t = None, None, None, None
                 split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
                 nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
@@ -524,31 +502,11 @@ def train():
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
 
 
-# if __name__ == '__main__':
-#     torch.set_float32_matmul_precision('high')
-#
-#     train()
-#     # test()
-
-
-
 if __name__ == '__main__':
-    device = torch.device("cuda")
-    encoder = HashEncoderNative(max_res=256, device=device).to(device)
-    model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=16 * 2).to(device)
+    torch.set_float32_matmul_precision('high')
 
-    input_tensor = torch.rand(256 * 192, 4, device=torch.device("cuda"), dtype=torch.float32)
-    input_tensor.requires_grad = True
-
-    def g(x):
-        return model(x)
-
-    h = encoder(input_tensor)
-    jac = torch.vmap(torch.func.jacrev(g))(h)
-    jac_x = _get_minibatch_jacobian(h, input_tensor)
-
-    print(f'jac shape: {jac.shape}')
-
+    train()
+    # test()
 
 
 # def test_jac(chunk_size):
