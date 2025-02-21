@@ -274,21 +274,7 @@ class PISGPipelineVelTorch:
             batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
             raw_vel, raw_f = self.query_velocity(xyzt=batch_input_xyzt_flat)
 
-            def func(xyzt):
-                return self.model(self.encoder(xyzt))
-
-            jacobian = vmap(jacrev(func))(batch_input_xyzt_flat)
-            jacobian = jacobian.squeeze(1).squeeze(1)
-            _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
-            _u_x, _u_y, _u_z, _u_t = None, None, None, None
-            split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
-            nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
-            split_nse_wei = [0.001]
-            nseloss_fine = 0.0
-            for ei, wi in zip(nse_errors, split_nse_wei):
-                nseloss_fine = ei * wi + nseloss_fine
-
-            return batch_rgb_map, raw_d, nseloss_fine
+            return batch_rgb_map, raw_d, raw_vel, raw_f, batch_input_xyzt_flat
 
         def PISG_forward_test(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
@@ -312,8 +298,8 @@ class PISGPipelineVelTorch:
 
         import tqdm
         train_iter = 0
-        loss_avg_list, loss_v_avg_list, loss_all_avg_list = [], [], []
-        loss_accum, loss_v_accum, loss_all_accum = 0.0, 0.0, 0.0
+        loss_avg_list, loss_v_avg_list, loss_d2v_avg_list, loss_all_avg_list = [], [], [], []
+        loss_accum, loss_v_accum, loss_d2v_accum, loss_all_accum = 0.0, 0.0, 0.0, 0.0
         for _1 in tqdm.trange(0, 1):
             dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
@@ -321,12 +307,33 @@ class PISGPipelineVelTorch:
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map, raw_d, nseloss_fine = self.compiled_forward(batch_points, batch_depths, batch_time)
+                batch_rgb_map, raw_d, raw_vel, raw_f, batch_input_xyzt_flat = self.compiled_forward(batch_points, batch_depths, batch_time)
 
+                def func(xyzt):
+                    return self.model(self.encoder(xyzt))
+
+                jacobian = vmap(jacrev(func))(batch_input_xyzt_flat)
+                jacobian = jacobian.squeeze(1).squeeze(1)
+                _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
+                _u_x, _u_y, _u_z, _u_t = None, None, None, None
+                split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
+                nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
+                split_nse_wei = [0.001]
+                nseloss_fine = 0.0
+                for ei, wi in zip(nse_errors, split_nse_wei):
+                    nseloss_fine = ei * wi + nseloss_fine
+
+                viz_dens_mask = raw_d.detach() > 0.1
+                vel_norm = raw_vel.norm(dim=-1, keepdim=True)
+                min_vel_mask = vel_norm.detach() < 0.2 * raw_d.detach()
+                vel_reg_mask = min_vel_mask & viz_dens_mask
+                min_vel_reg_map = (0.2 * raw_d - vel_norm) * vel_reg_mask.float()
+                min_vel_reg = min_vel_reg_map.pow(2).mean()
+                loss_d2v = min_vel_reg
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 loss_vel = nseloss_fine
-                loss = loss_image + loss_vel
+                loss = 10000 * loss_image + 1 * loss_vel + 10 * loss_d2v
                 self.optimizer.zero_grad()
                 self.optimizer_v.zero_grad()
                 loss.backward()
@@ -338,18 +345,22 @@ class PISGPipelineVelTorch:
                 train_iter += 1
                 loss_accum += loss_image.item()
                 loss_v_accum += loss_vel.item()
+                loss_d2v_accum += loss_d2v.item()
                 loss_all_accum += loss.item()
                 if train_iter % 100 == 0:
                     loss_avg = loss_accum / 100.0
                     loss_v_avg = loss_v_accum / 100.0
+                    loss_d2v_avg = loss_d2v_accum / 100.0
                     loss_all_avg = loss_all_accum / 100.0
                     loss_avg_list.append(loss_avg)
                     loss_v_avg_list.append(loss_v_avg)
+                    loss_d2v_avg_list.append(loss_d2v_avg)
                     loss_all_avg_list.append(loss_all_avg)
                     loss_accum = 0.0
                     loss_v_accum = 0.0
+                    loss_d2v_accum = 0.0
                     loss_all_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.4f}, {loss_v_avg:.4f}, {loss_all_avg:.4f}")
+                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.4f}, {loss_v_avg:.4f}, {loss_d2v_avg:.4f}, {loss_all_avg:.4f}")
 
         if save_ckp_path is not None:
             torch.save({
@@ -509,7 +520,6 @@ if __name__ == '__main__':
 
     train()
     # test()
-
 
 # def test_jac(chunk_size):
 #     import time
