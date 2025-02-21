@@ -362,6 +362,44 @@ class PISGPipelineVelTorch:
                     loss_all_accum = 0.0
                     tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.4f}, {loss_v_avg:.4f}, {loss_d2v_avg:.4f}, {loss_all_avg:.4f}")
 
+        import matplotlib.pyplot as plt
+
+        # 绘制 image loss 曲线
+        plt.figure()
+        plt.plot(loss_avg_list, label='Image Loss')
+        plt.title("Average Image Loss")
+        plt.xlabel("Iteration (per 100 iterations)")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.show()
+
+        # 绘制 NSE/velocity loss 曲线
+        plt.figure()
+        plt.plot(loss_v_avg_list, label='NSE Loss')
+        plt.title("Average NSE Loss")
+        plt.xlabel("Iteration (per 100 iterations)")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.show()
+
+        # 绘制 velocity regularization (d2v) loss 曲线
+        plt.figure()
+        plt.plot(loss_d2v_avg_list, label='d2v Loss')
+        plt.title("Average d2v Loss")
+        plt.xlabel("Iteration (per 100 iterations)")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.show()
+
+        # 绘制总 loss 曲线
+        plt.figure()
+        plt.plot(loss_all_avg_list, label='Total Loss')
+        plt.title("Average Total Loss")
+        plt.xlabel("Iteration (per 100 iterations)")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.show()
+
         if save_ckp_path is not None:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
