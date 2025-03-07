@@ -471,7 +471,7 @@ class PISGPipelineVelTorch:
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
-    def export_density_grid(self, save_ckp_path, target_timestamp: int, output_dir="output"):
+    def export_density_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
         import numpy as np
         os.makedirs(output_dir, exist_ok=True)
 
@@ -482,10 +482,10 @@ class PISGPipelineVelTorch:
         self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         with torch.no_grad():
-            den = self.compiled_query_density_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=256, time=float(target_timestamp / 120.0))
+            den = self.compiled_query_density_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=resolution, time=float(target_timestamp / 120.0))
             np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
 
-    def export_velocity_grid(self, save_ckp_path, target_timestamp: int, output_dir="output"):
+    def export_velocity_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
         import numpy as np
         os.makedirs(output_dir, exist_ok=True)
 
@@ -496,7 +496,7 @@ class PISGPipelineVelTorch:
         self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         with torch.no_grad():
-            vel, f = self.compiled_query_velocity_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=256, time=float(target_timestamp / 120.0))
+            vel, f = self.compiled_query_velocity_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=resolution, time=float(target_timestamp / 120.0))
             np.savez_compressed(f"{output_dir}/velocity_{target_timestamp:03d}.npz", vel=vel.cpu().numpy(), f=f.cpu().numpy())
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
@@ -615,22 +615,22 @@ def export_density(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
-    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+    pipeline = PISGPipelineVelTorch(torch_device=device, torch_dtype=torch.float32)
 
     for _ in range(120):
         if _ % 2 == rank:
-            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_)
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64)
 
 
 def export_velocity(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
-    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+    pipeline = PISGPipelineVelTorch(device, torch_dtype=torch.float32)
 
     for _ in range(120):
         if _ % 2 == rank:
-            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_)
+            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64)
 
 
 def run_multidevice(func):
