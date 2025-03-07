@@ -111,7 +111,8 @@ class HashEncoderNative(torch.nn.Module):
 
         # 从哈希表中获取特征: corner_features => [n, L, 16, features_per_level]
         corner_index_flat = corner_index.view(-1)  # [n * L * 16]
-        corner_features_flat = self.hash_table[corner_index_flat]  # [n * L * 16, F]
+        corner_features_flat = self.hash_table[corner_index_flat].clone()
+        # corner_features_flat = self.hash_table[corner_index_flat]  # [n * L * 16, F]
         corner_features = corner_features_flat.view(
             corner_index.shape[0], corner_index.shape[1], 16, self.features_per_level
         )
