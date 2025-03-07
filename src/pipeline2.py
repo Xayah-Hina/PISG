@@ -1,3 +1,5 @@
+import typing
+
 import torch
 import torchvision.io as io
 import torch.multiprocessing as mp
@@ -244,6 +246,12 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     return dirs, u, v
 
 
+def sample_points(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, device: torch.device, dtype: torch.dtype):
+    xs, ys, zs = torch.meshgrid([torch.linspace(x_min, x_max, res, device=device, dtype=dtype), torch.linspace(y_min, y_max, res, device=device, dtype=dtype), torch.linspace(z_min, z_max, res, device=device, dtype=dtype)], indexing='ij')
+    grids = torch.stack([xs, ys, zs], dim=-1)
+    return grids
+
+
 class PISGPipelineVelTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
@@ -275,7 +283,6 @@ class PISGPipelineVelTorch:
 
             return batch_rgb_map, raw_d, batch_input_xyzt_flat
 
-
         def PISG_forward_v(batch_input_xyzt_flat: torch.Tensor, raw_d: torch.Tensor, jacobian: torch.Tensor):
             raw_vel, raw_f = self.query_velocity(xyzt=batch_input_xyzt_flat)
 
@@ -303,11 +310,28 @@ class PISGPipelineVelTorch:
             batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
             return batch_rgb_map, raw_d
 
+        def PISG_query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
+            xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+            xyzt_flat = torch.cat([xyz, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+            raw_d_flat = self.model(self.encoder(xyzt_flat))  # (res * res * res, 1)
+            raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
+            return raw_d
+
+        def PISG_query_velocity_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
+            xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+            xyzt_flat = torch.cat([xyz, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+            raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(xyzt_flat))  # (res * res * res, 3)
+            raw_v = raw_v_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
+            raw_f = raw_f_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
+            return raw_v, raw_f
+
         # self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
         # self.compiled_forward_v = torch.compile(PISG_forward_v, mode="max-autotune")
         self.compiled_forward = PISG_forward
         self.compiled_forward_v = PISG_forward_v
         self.compiled_forward_test = torch.compile(PISG_forward_test, mode="max-autotune")
+        self.compiled_query_density_grid = torch.compile(PISG_query_density_grid, mode="max-autotune")
+        self.compiled_query_velocity_grid = torch.compile(PISG_query_velocity_grid, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
 
@@ -332,12 +356,13 @@ class PISGPipelineVelTorch:
                     tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map, raw_d, batch_input_xyzt_flat = self.compiled_forward(batch_points, batch_depths, batch_time)
+
                 def func(xyzt):
                     return self.model(self.encoder(xyzt))
+
                 jacobian = vmap(jacrev(func))(batch_input_xyzt_flat)
                 jacobian = jacobian.squeeze(1).squeeze(1)
                 nseloss_fine, min_vel_reg = self.compiled_forward_v(batch_input_xyzt_flat, raw_d, jacobian)
-
 
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 loss_vel = nseloss_fine
@@ -424,7 +449,9 @@ class PISGPipelineVelTorch:
 
         ckpt = torch.load(save_ckp_path)
         self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
         self.model.load_state_dict(ckpt['model_state_dict'])
+        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         poses, focals, width, height = poses[:1], focals[:1], int(width * self.ratio), int(height * self.ratio)
@@ -443,6 +470,34 @@ class PISGPipelineVelTorch:
             rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
+
+    def export_density_grid(self, save_ckp_path, target_timestamp: int, output_dir="output"):
+        import numpy as np
+        os.makedirs(output_dir, exist_ok=True)
+
+        ckpt = torch.load(save_ckp_path)
+        self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
+
+        with torch.no_grad():
+            den = self.compiled_query_density_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=256, time=float(target_timestamp / 120.0))
+            np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
+
+    def export_velocity_grid(self, save_ckp_path, target_timestamp: int, output_dir="output"):
+        import numpy as np
+        os.makedirs(output_dir, exist_ok=True)
+
+        ckpt = torch.load(save_ckp_path)
+        self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
+
+        with torch.no_grad():
+            vel, f = self.compiled_query_velocity_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=256, time=float(target_timestamp / 120.0))
+            np.savez_compressed(f"{output_dir}/velocity_{target_timestamp:03d}.npz", vel=vel.cpu().numpy(), f=f.cpu().numpy())
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
         raw_d_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
@@ -551,67 +606,43 @@ def test_pipeline(rank, gpu_size):
             pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=_)
 
 
-def test():
-    gpu_size = torch.cuda.device_count()
-    print(f"Launching {gpu_size} processes for GPU tasks.")
-    mp.spawn(test_pipeline, args=(gpu_size,), nprocs=gpu_size, join=True)
-
-
 def train():
     pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
+
+
+def export_density(rank, gpu_size):
+    device = torch.device(f"cuda:{rank % gpu_size}")
+    print(f"Process {rank} running on {device}")
+
+    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+
+    for _ in range(120):
+        if _ % 2 == rank:
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_)
+
+
+def export_velocity(rank, gpu_size):
+    device = torch.device(f"cuda:{rank % gpu_size}")
+    print(f"Process {rank} running on {device}")
+
+    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+
+    for _ in range(120):
+        if _ % 2 == rank:
+            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_)
+
+
+def run_multidevice(func):
+    gpu_size = torch.cuda.device_count()
+    print(f"Launching {gpu_size} processes for GPU tasks.")
+    mp.spawn(func, args=(gpu_size,), nprocs=gpu_size, join=True)
 
 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
     # train()
-    test()
-
-# def test_jac(chunk_size):
-#     import time
-#     # 初始化 pipeline
-#     pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
-#
-#     # 清除 CUDA 内存缓存，确保数据独立
-#     torch.cuda.empty_cache()
-#     torch.cuda.reset_peak_memory_stats()
-#
-#     # 创建输入张量
-#     input_tensor = torch.rand(256 * 192, 4, device=torch.device("cuda"), dtype=torch.float32)
-#
-#     # 记录开始时间
-#     start_time = time.perf_counter()
-#
-#     # 计算 Jacobian
-#     jac_final = pipeline.calculate_jacobian(input_tensor, chunk_size)
-#
-#     # 确保 GPU 计算完成
-#     torch.cuda.synchronize()
-#
-#     # 记录结束时间
-#     end_time = time.perf_counter()
-#
-#     # 获取最高显存占用（单位 MB）
-#     max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-#     elapsed_time = end_time - start_time
-#
-#     print(
-#         f"Chunk size: {chunk_size}, Jacobian shape: {jac_final.shape}, Max GPU Memory: {max_memory:.2f} MB, Time: {elapsed_time:.4f} sec")
-#
-#     # 释放 GPU 变量
-#     del pipeline, input_tensor, jac_final
-#
-#     # 清空显存缓存，释放未使用的显存
-#     torch.cuda.empty_cache()
-#     torch.cuda.ipc_collect()
-#
-#
-# if __name__ == '__main__':
-#     torch.set_float32_matmul_precision('high')
-#     for cs in [512, 1024, 256 * 192]:
-#         test_jac(cs)
-
-# Chunk size: 512, Jacobian shape: torch.Size([49152, 1, 4]), Max GPU Memory: 12612.29 MB, Time: 7.2823 sec
-# Chunk size: 1024, Jacobian shape: torch.Size([49152, 1, 4]), Max GPU Memory: 14310.39 MB, Time: 5.0719 sec
-# Chunk size: 49152, Jacobian shape: torch.Size([49152, 1, 4]), Max GPU Memory: 39880.85 MB, Time: 9.3621 sec
+    # run_multidevice(test_pipeline)
+    run_multidevice(export_density)
+    # run_multidevice(export_velocity)
