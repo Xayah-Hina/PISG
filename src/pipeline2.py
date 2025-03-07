@@ -312,14 +312,16 @@ class PISGPipelineVelTorch:
 
         def PISG_query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
             xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyzt_flat = torch.cat([xyz, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+            xyz_normalized = normalize_points(points=xyz, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+            xyzt_flat = torch.cat([xyz_normalized, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
             raw_d_flat = self.model(self.encoder(xyzt_flat))  # (res * res * res, 1)
             raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
             return raw_d
 
         def PISG_query_velocity_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
             xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyzt_flat = torch.cat([xyz, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+            xyz_normalized = normalize_points(points=xyz, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+            xyzt_flat = torch.cat([xyz_normalized, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
             raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(xyzt_flat))  # (res * res * res, 3)
             raw_v = raw_v_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
             raw_f = raw_f_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
