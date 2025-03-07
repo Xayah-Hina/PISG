@@ -619,7 +619,7 @@ def export_density(rank, gpu_size):
 
     for _ in range(120):
         if _ % 2 == rank:
-            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64)
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/den")
 
 
 def export_velocity(rank, gpu_size):
@@ -630,7 +630,7 @@ def export_velocity(rank, gpu_size):
 
     for _ in range(120):
         if _ % 2 == rank:
-            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64)
+            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/vel")
 
 
 def run_multidevice(func):
@@ -645,4 +645,5 @@ if __name__ == '__main__':
     # train()
     # run_multidevice(test_pipeline)
     run_multidevice(export_density)
+    run_multidevice(export_velocity)
     # run_multidevice(export_velocity)
