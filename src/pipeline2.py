@@ -295,7 +295,8 @@ class PISGPipelineVelTorch:
             for ei, wi in zip(nse_errors, split_nse_wei):
                 nseloss_fine = ei * wi + nseloss_fine
 
-            viz_dens_mask = raw_d.detach() > 0.1
+            tau = 0.0001746864290907979
+            viz_dens_mask = raw_d.detach() > tau
             vel_norm = raw_vel.norm(dim=-1, keepdim=True)
             min_vel_mask = vel_norm.detach() < 0.2 * raw_d.detach()
             vel_reg_mask = min_vel_mask & viz_dens_mask
@@ -327,10 +328,10 @@ class PISGPipelineVelTorch:
             raw_f = raw_f_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
             return raw_v, raw_f
 
-        # self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
-        # self.compiled_forward_v = torch.compile(PISG_forward_v, mode="max-autotune")
-        self.compiled_forward = PISG_forward
-        self.compiled_forward_v = PISG_forward_v
+        self.compiled_forward = torch.compile(PISG_forward)
+        self.compiled_forward_v = torch.compile(PISG_forward_v)
+        # self.compiled_forward = PISG_forward
+        # self.compiled_forward_v = PISG_forward_v
         self.compiled_forward_test = torch.compile(PISG_forward_test, mode="max-autotune")
         self.compiled_query_density_grid = torch.compile(PISG_query_density_grid, mode="max-autotune")
         self.compiled_query_velocity_grid = torch.compile(PISG_query_velocity_grid, mode="max-autotune")
@@ -396,7 +397,7 @@ class PISGPipelineVelTorch:
                     loss_v_accum = 0.0
                     loss_d2v_accum = 0.0
                     loss_all_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.4f}, {loss_v_avg:.4f}, {loss_d2v_avg:.4f}, {loss_all_avg:.4f}")
+                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.8f}, {loss_v_avg:.8f}, {loss_d2v_avg:.8f}, {loss_all_avg:.8f}")
 
         import matplotlib.pyplot as plt
 
@@ -484,8 +485,17 @@ class PISGPipelineVelTorch:
         self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         with torch.no_grad():
-            den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
-            np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
+            den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0,
+                                                   z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
+            # np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
+            # print(f"Max Element: {den.max().item()}, Mean Element: {den.mean().item()}, Min Element: {den.min().item()} RGB: {self.model.rgb}")
+
+            from skimage.filters import threshold_otsu
+            density_np = den.cpu().numpy().flatten()  # 转换为 numpy 数组，并展平成一维
+            tau = threshold_otsu(density_np)  # 使用 Otsu 方法计算阈值
+            mask = den > tau * 0.1
+            # np.savez_compressed(f"{output_dir}/mask_{target_timestamp:03d}.npz", mask=mask.cpu().numpy())
+            print(f"Threshold: {tau}, Mask Sum: {mask.numel()} Mask Not Zero: {mask.sum()}")
 
     def export_velocity_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
         import numpy as np
@@ -644,8 +654,8 @@ def run_multidevice(func):
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    # train()
+    train()
     # run_multidevice(test_pipeline)
-    run_multidevice(export_density)
-    run_multidevice(export_velocity)
+    # run_multidevice(export_density)
+    # run_multidevice(export_velocity)
     # run_multidevice(export_velocity)
