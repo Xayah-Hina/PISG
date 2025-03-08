@@ -484,7 +484,7 @@ class PISGPipelineVelTorch:
         self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         with torch.no_grad():
-            den = self.compiled_query_density_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=resolution, time=float(target_timestamp / 120.0))
+            den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
             np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
 
     def export_velocity_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
@@ -498,7 +498,7 @@ class PISGPipelineVelTorch:
         self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         with torch.no_grad():
-            vel, f = self.compiled_query_velocity_grid(x_min=-20.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=20.0, res=resolution, time=float(target_timestamp / 120.0))
+            vel, f = self.compiled_query_velocity_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
             np.savez_compressed(f"{output_dir}/velocity_{target_timestamp:03d}.npz", vel=vel.cpu().numpy(), f=f.cpu().numpy())
 
     def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
