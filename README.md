@@ -7,6 +7,7 @@
   - torch 2.6.0 + cu126
   - numpy 2.1.2
   - scipy 1.15.2
+  - scikit-image
   - tqdm 4.67.1
   - pytorch-memlab 0.3.0
 - load dataset only
