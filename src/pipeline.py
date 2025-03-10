@@ -12,8 +12,17 @@ from model.encoder_hyfluid import HashEncoderNative
 """
 Performance:
 
-- 1024 + 1.0 - 62.30it/s, 2.52min, 36.5GB
-- 1024 + 1.0
+- 1024 + 1.0 - 8100it, 62.30it/s, 134s, 37.4GB
+
+- 2048 + 1.0 - 4050it, 37.40it/s, 110s, 37.4GB
+- 512 + 1.0 - 16200it, 90.26it/s, , 181s, 37.4GB
+- 256 + 1.0 - 32400it, 128.83it/s, 254s, 37.4GB
+- 128 + 1.0 - 64800it, 142.91it/s, 461s, 37.4GB
+
+- 1024 + 0.5 - 2025it, 66.37it/s, 45s, 12.5GB
+
+- 1024 + 1.0 ( with mask filter ): 3721it, 62.70it/s, 100s, 37.4GB
+
 """
 
 def find_relative_paths(relative_path_list):
@@ -122,6 +131,60 @@ def sample_frustum(dirs: torch.Tensor, poses: torch.Tensor, near: float, far: fl
         yield batch_points, batch_depths, batch_indices
 
 
+def sample_frustum_with_mask(dirs: torch.Tensor, poses: torch.Tensor, mask: torch.Tensor, near: float, far: float, depth: int, batch_size: int, randomize: bool, device: torch.device, dtype: torch.dtype):
+    """
+    Sample points in the frustum of each camera with mask filtering.
+
+    Args:
+    - dirs: torch.Tensor of shape (N, H, W, 3)
+    - poses: torch.Tensor of shape (N, 4, 4)
+    - mask: torch.Tensor of shape (N, 4)
+    - near: float
+    - far: float
+    - depth: int
+    - batch_size: int
+    - randomize: bool
+
+    Yields:
+    - points: torch.Tensor of shape (batch_size, depth, 3)
+    """
+
+    N, H, W = dirs.shape[:3]
+    num_origin = N * H * W
+
+    rays_d = torch.einsum('nij,nhwj->nhwi', poses[:, :3, :3], dirs)  # (N, H, W, 3)
+    rays_o = poses[:, None, None, :3, 3].expand(rays_d.shape)  # (N, H, W, 3)
+
+    rays_d = run_filter1(rays_d, mask)
+    rays_o = run_filter1(rays_o, mask)
+
+    indices_origin = torch.arange(num_origin, device=device)  # (N*H*W)
+    indices_origin_shaped = indices_origin.reshape(N, H, W, 1)
+    indices_filtered = run_filter1(indices_origin_shaped, mask).flatten()  # (filtered)
+
+    num_filtered = rays_d.shape[0]
+    if randomize:
+        indices_inner = torch.randperm(num_filtered, device=device)  # (N*H*W)
+    else:
+        indices_inner = torch.arange(num_filtered, device=device)  # (N*H*W)
+
+    depths = torch.linspace(near, far, steps=depth, device=device, dtype=dtype).unsqueeze(0)  # (1, depth)
+    for i in range(0, num_filtered, batch_size):
+        idx = indices_inner[i:i + batch_size]
+        batch_rays_o = rays_o[idx]  # (batch_size, 3)
+        batch_rays_d = rays_d[idx]  # (batch_size, 3)
+
+        batch_depths = depths.clone()
+        if randomize:
+            midpoints = (depths[:, :-1] + depths[:, 1:]) / 2.0
+            noise = (torch.rand_like(midpoints) - 0.5) * (far - near) / depth
+            batch_depths[:, :-1] = midpoints + noise
+
+        batch_points = batch_rays_o[:, None, :] + batch_rays_d[:, None, :] * batch_depths[:, :, None]  # (batch_size, depth, 3)
+        batch_indices = indices_filtered[idx]
+        yield batch_points, batch_depths, batch_indices
+
+
 def sample_random_frame(videos_data: torch.Tensor, batch_indices: torch.Tensor, device: torch.device, dtype: torch.dtype):
     """
     Sample a random frame from the given videos data.
@@ -188,6 +251,53 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     return dirs, u, v
 
 
+def get_filter_mask(video_tensor):
+    # 1. 对通道做any运算，判断每个像素在一帧内是否非0
+    mask_tensor = (video_tensor != 0)
+    frame_mask = mask_tensor.any(dim=-1)  # shape: [120, 4, 1920, 1080]
+
+    # 2. 对帧做any运算，得到每个视频中每个像素是否曾非0
+    video_mask = frame_mask.any(dim=0)  # shape: [4, 1920, 1080]
+
+    # 3. 对于每个视频计算包围矩形
+    bboxes = []
+    for mask in video_mask:
+        coords = mask.nonzero()
+        if coords.numel() == 0:
+            raise AssertionError("All frames are zero.")
+        # nonzero 返回的坐标顺序为 (row, col)，即 (y, x)
+        y_min, x_min = coords.min(dim=0).values
+        y_max, x_max = coords.max(dim=0).values
+        # 调整顺序为 [x_min, x_max, y_min, y_max]
+        bbox = torch.stack([x_min, x_max, y_min, y_max])
+        bboxes.append(bbox)
+    # 堆叠后得到形状为 [videos, 4]
+    return torch.stack(bboxes, dim=0)
+
+
+def run_filter1(dirs: torch.Tensor, mask: torch.Tensor):
+    """
+    Args:
+        dirs: torch.Tensor，形状为 [4, 1920, 1080, 3]，每个视频的方向数据
+        mask: torch.Tensor，形状为 [4, 4]，每一行格式为 [x_min, x_max, y_min, y_max]
+
+    Returns:
+        flattened_dirs: torch.Tensor，形状为 (X, 3)，包含所有视频在对应 bounding box 内的方向数据，经过扁平化
+    """
+    flattened_list = []
+    for d, bbox in zip(dirs, mask):
+        # mask 的每一行为 [x_min, x_max, y_min, y_max]
+        x_min, x_max, y_min, y_max = bbox.tolist()
+        # 注意这里对索引转换为 int，并加 1 以确保包含上界
+        filtered = d[int(y_min):int(y_max) + 1, int(x_min):int(x_max) + 1, :]
+        # 扁平化为 (N, 3) 的形状
+        flattened = filtered.reshape(-1, filtered.shape[-1])
+        flattened_list.append(flattened)
+    # 将所有视频的扁平化 tensor 在第一维上拼接起来
+    flattened_dirs = torch.cat(flattened_list, dim=0)
+    return flattened_dirs
+
+
 class PISGPipelineTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
@@ -218,6 +328,7 @@ class PISGPipelineTorch:
 
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
+        masks = get_filter_mask(video_tensor=videos_data)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         width = int(width * self.ratio)
         height = int(height * self.ratio)
@@ -227,7 +338,7 @@ class PISGPipelineTorch:
             dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
