@@ -134,12 +134,14 @@ def sample_random_frame(videos_data: torch.Tensor, batch_indices: torch.Tensor, 
     - batch_time: torch.Tensor of shape (1)
     - batch_target_pixels: torch.Tensor of shape (batch_size, C)
     """
-    frame = random.uniform(0, videos_data.shape[0] - 1)
-    frame_floor, frame_ceil, frames_alpha = int(frame), int(frame) + 1, frame - int(frame)
+    frame = torch.rand((), device=device, dtype=dtype) * (videos_data.shape[0] - 1)
+    frame_floor = torch.floor(frame).long()
+    frame_ceil = frame_floor + 1
+    frames_alpha = frame - frame_floor.to(frame.dtype)
     target_frame = (1 - frames_alpha) * videos_data[frame_floor] + frames_alpha * videos_data[frame_ceil]  # (V * H * W, C)
     target_frame = target_frame.reshape(-1, 3)
     batch_target_pixels = target_frame[batch_indices]  # (batch_size, C)
-    batch_time = torch.tensor(frame / (videos_data.shape[0] - 1), device=device, dtype=dtype)
+    batch_time = frame / (videos_data.shape[0] - 1)
 
     return batch_time, batch_target_pixels
 
@@ -206,12 +208,11 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-        def PISG_forward(videos_data: torch.Tensor, batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_indices: torch.Tensor):
-            batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
+        def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
             batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-            return batch_rgb_map, batch_target_pixels
+            return batch_rgb_map
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
@@ -227,7 +228,8 @@ class PISGPipelineTorch:
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
-                batch_rgb_map, batch_target_pixels = self.compiled_forward(videos_data=videos_data_resampled, batch_points=batch_points, batch_depths=batch_depths, batch_indices=batch_indices)
+                batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
+                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
@@ -259,8 +261,7 @@ class PISGPipelineTorch:
         with torch.no_grad():
             dirs, _, _ = shuffle_uv(focals=focals, width=width, height=height, randomize=False, device=self.device, dtype=self.dtype)
             rgb_map_list = []
-            for _1, (batch_points, batch_depths, batch_indices) in enumerate(
-                    tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
