@@ -9,6 +9,12 @@ from pathlib import Path
 from model.model_hyfluid import NeRFSmall
 from model.encoder_hyfluid import HashEncoderNative
 
+"""
+Performance:
+
+- 1024 + 1.0 - 62.30it/s, 2.52min, 36.5GB
+- 1024 + 1.0
+"""
 
 def find_relative_paths(relative_path_list):
     current_dir = Path.cwd()
@@ -200,16 +206,17 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-        def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
+        def PISG_forward(videos_data: torch.Tensor, batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_indices: torch.Tensor):
+            batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
             batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
             batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-            return batch_rgb_map
+            return batch_rgb_map, batch_target_pixels
 
         self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
-        videos_data = self.load_videos_data(*training_videos, ratio=self.ratio) # (T, V, H, W, C)
+        videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
         width = int(width * self.ratio)
         height = int(height * self.ratio)
@@ -219,10 +226,8 @@ class PISGPipelineTorch:
             dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(
-                    tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
-                batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
+                batch_rgb_map, batch_target_pixels = self.compiled_forward(videos_data=videos_data_resampled, batch_points=batch_points, batch_depths=batch_depths, batch_indices=batch_indices)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
@@ -373,13 +378,13 @@ def test():
     mp.spawn(test_pipeline, args=(gpu_size,), nprocs=gpu_size, join=True)
 
 
-def train():
-    pipeline = PISGPipelineTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
+def train(target_device):
+    pipeline = PISGPipelineTorch(torch_device=target_device, torch_dtype=torch.float32)
     pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
 
 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    train()
+    train(target_device=torch.device("cuda:0"))
     # test()
