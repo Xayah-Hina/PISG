@@ -353,11 +353,10 @@ def is_points_in_frustum(points, camera_poses, focals, width, height, near, far)
     return in_frustum
 
 
-def run_filter2(points: torch.Tensor, camera_poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
-    points = points.reshape(-1, 3)
-    in_frustum_mask = is_points_in_frustum(points, camera_poses, focals, width, height, near, far)
-    in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
-    return points[in_all_frustum_mask], in_all_frustum_mask
+def sample_points(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, device: torch.device, dtype: torch.dtype):
+    xs, ys, zs = torch.meshgrid([torch.linspace(x_min, x_max, res, device=device, dtype=dtype), torch.linspace(y_min, y_max, res, device=device, dtype=dtype), torch.linspace(z_min, z_max, res, device=device, dtype=dtype)], indexing='ij')
+    grids = torch.stack([xs, ys, zs], dim=-1)
+    return grids
 
 
 class PISGPipelineTorch:
@@ -380,13 +379,32 @@ class PISGPipelineTorch:
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-        def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
-            batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
-            batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+        def volume_render(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+            batch_points_flat = batch_points.reshape(-1, 3)  # (batch_size * depth, 3)
+            in_frustum_mask = is_points_in_frustum(points=batch_points_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+            in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
+            batch_points_normalized_flat = normalize_points(points=batch_points_flat, device=self.device, dtype=self.dtype)  # (batch_size * depth, 3)
+            batch_input_xyzt_flat = torch.cat([batch_points_normalized_flat, batch_time.expand(batch_points_normalized_flat[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+            batch_rgb_map = self.query_rgb_map_skip_ghost(batch_input_xyzt_flat=batch_input_xyzt_flat, batch_depths=batch_depths, in_all_frustum_mask=in_all_frustum_mask)
             return batch_rgb_map
 
-        self.compiled_forward = torch.compile(PISG_forward, mode="max-autotune")
+        self.compiled_volume_render = torch.compile(volume_render, mode="max-autotune")
+
+        def query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+            with torch.no_grad():
+                xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+                xyz_flat = xyz.reshape(-1, 3)  # (res * res * res, 3)
+                in_frustum_mask = is_points_in_frustum(points=xyz_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)  # (res * res * res, N)
+                in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)  # (res * res * res)
+                xyz_normalized_flat = normalize_points(points=xyz_flat, device=self.device, dtype=self.dtype)  # (res * res * res, 3)
+                input_xyzt_flat = torch.cat([xyz_normalized_flat, torch.ones_like(xyz_normalized_flat[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+                raw_d_flat = self.model(self.encoder(input_xyzt_flat))  # (res * res * res, 1)
+                in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (res * res * res, 1)
+                raw_d_flat = raw_d_flat * in_all_frustum_mask_float
+                raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
+                return raw_d
+
+        self.compiled_query_density_grid = torch.compile(query_density_grid, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
@@ -402,7 +420,7 @@ class PISGPipelineTorch:
 
             for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
+                batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, batch_time, poses, focals, width, height, near, far)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
                 self.optimizer.zero_grad()
                 loss_image.backward()
@@ -425,32 +443,43 @@ class PISGPipelineTorch:
         self.model.load_state_dict(ckpt['model_state_dict'])
 
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        poses = poses[:1]
-        focals = focals[:1]
 
         batch_size = 1024
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
         import tqdm
         with torch.no_grad():
-            dirs, _, _ = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=False, device=self.device, dtype=self.dtype)
+            dirs, _, _ = shuffle_uv(focals=focals[:1], width=int(width[0].item()), height=int(height[0].item()), randomize=False, device=self.device, dtype=self.dtype)
             rgb_map_list = []
-            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
-                batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses[:1], near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
+                batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, test_timestamp, poses, focals, width, height, near, far)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
-            rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+            rgb_map = rgb_map_flat.reshape(height[0].item(), width[0].item(), rgb_map_flat.shape[-1])  # (H, W, 3)
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
-    def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
-        raw_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
+    def export_density_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
+        import numpy as np
+        os.makedirs(output_dir, exist_ok=True)
+
+        ckpt = torch.load(save_ckp_path)
+        self.encoder.load_state_dict(ckpt['encoder_state_dict'])
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+
+        den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+        np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
+
+    def query_rgb_map_skip_ghost(self, batch_input_xyzt_flat: torch.Tensor, batch_depths: torch.Tensor, in_all_frustum_mask: torch.Tensor):
+        raw_flat = self.model(self.encoder(batch_input_xyzt_flat))  # (batch_size * depth, 4)
+        in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (N,1)
+        raw_flat = raw_flat * in_all_frustum_mask_float
         raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
         alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
-        rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
-
-        return rgb_map
+        batch_rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+        return batch_rgb_map
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
@@ -550,10 +579,21 @@ def test_pipeline(rank, gpu_size):
             pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=_)
 
 
-def test():
+def export_density(rank, gpu_size):
+    device = torch.device(f"cuda:{rank % gpu_size}")
+    print(f"Process {rank} running on {device}")
+
+    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
+
+    for _ in range(120):
+        if _ % 2 == rank:
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/den")
+
+
+def run_multidevice(func):
     gpu_size = torch.cuda.device_count()
     print(f"Launching {gpu_size} processes for GPU tasks.")
-    mp.spawn(test_pipeline, args=(gpu_size,), nprocs=gpu_size, join=True)
+    mp.spawn(func, args=(gpu_size,), nprocs=gpu_size, join=True)
 
 
 def train(target_device):
@@ -564,5 +604,6 @@ def train(target_device):
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    train(target_device=torch.device("cuda:0"))
-    # test()
+    # train(target_device=torch.device("cuda:0"))
+    run_multidevice(test_pipeline)
+    run_multidevice(export_density)
