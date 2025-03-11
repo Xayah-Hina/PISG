@@ -298,6 +298,67 @@ def run_filter1(dirs: torch.Tensor, mask: torch.Tensor):
     return flattened_dirs
 
 
+def is_points_in_frustum(points, camera_poses, focals, width, height, near, far):
+    """
+    判断 M 个 3D 点是否在 N 个相机的视锥体内
+    points: (M, 3)  ->  M 个 3D 点
+    camera_poses: (N, 4, 4)  ->  N 个相机的 4x4 位姿矩阵
+    focals, width, height, near, far: (N,)  ->  每个相机的参数
+    返回: (M, N)  ->  M 个点是否在 N 个相机视锥体内的布尔张量
+    """
+
+    def perspective_matrix(focals, width, height, near, far):
+        """ 计算 N 个相机的透视投影矩阵 (N, 4, 4) """
+        N = focals.shape[0]
+        P = torch.zeros((N, 4, 4), device=focals.device)
+
+        P[:, 0, 0] = 2 * focals / width
+        P[:, 1, 1] = 2 * focals / height
+        P[:, 2, 2] = -(far + near) / (far - near)
+        P[:, 2, 3] = -2 * far * near / (far - near)
+        P[:, 3, 2] = -1
+
+        return P
+
+    N = camera_poses.shape[0]
+    M = points.shape[0]
+
+    # 计算 N 个透视投影矩阵 (N, 4, 4)
+    P = perspective_matrix(focals, width, height, near, far)
+
+    # 计算 N 个视图矩阵 (N, 4, 4)
+    V = torch.inverse(camera_poses)
+
+    # 扩展 M 个点为 (M, 4) 的齐次坐标
+    ones = torch.ones((M, 1), device=points.device)
+    points_h = torch.cat([points, ones], dim=-1).unsqueeze(0)  # (1, M, 4)
+
+    # 变换点到相机坐标系 (N, M, 4)
+    points_cam = torch.einsum('nij,mj->nmi', V, points_h.squeeze(0))
+
+    # 变换点到裁剪空间 (N, M, 4)
+    points_clip = torch.einsum('nij,nmj->nmi', P, points_cam)
+
+    # 进行透视除法 (N, M, 3)
+    points_ndc = points_clip[:, :, :3] / points_clip[:, :, 3].unsqueeze(-1)
+
+    # 检查是否在 NDC 空间 (-1, 1) 内 (M, N)
+    in_frustum = (
+            (points_ndc[:, :, 0] >= -1) & (points_ndc[:, :, 0] <= 1) &  # -1 ≤ x ≤ 1
+            (points_ndc[:, :, 1] >= -1) & (points_ndc[:, :, 1] <= 1) &  # -1 ≤ y ≤ 1
+            (points_ndc[:, :, 2] >= -1) & (points_ndc[:, :, 2] <= 1)  # -1 ≤ z ≤ 1
+    ).T  # 转置以匹配 (M, N)
+
+    return in_frustum
+
+
+def run_filter2(points: torch.Tensor, camera_poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+    points = points.reshape(-1, 3)
+    in_frustum_mask = is_points_in_frustum(points, camera_poses, focals, width, height, near, far)
+    in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
+    return points[in_all_frustum_mask], in_all_frustum_mask
+
+
 class PISGPipelineTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
@@ -330,15 +391,15 @@ class PISGPipelineTorch:
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
         masks = get_filter_mask(video_tensor=videos_data)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        width = int(width * self.ratio)
-        height = int(height * self.ratio)
+        width = width * self.ratio
+        height = height * self.ratio
 
         import tqdm
         for _1 in tqdm.trange(0, 1):
-            dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
+            dirs, u, v = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=True, device=self.device, dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, batch_time)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
@@ -370,9 +431,9 @@ class PISGPipelineTorch:
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
         import tqdm
         with torch.no_grad():
-            dirs, _, _ = shuffle_uv(focals=focals, width=width, height=height, randomize=False, device=self.device, dtype=self.dtype)
+            dirs, _, _ = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=False, device=self.device, dtype=self.dtype)
             rgb_map_list = []
-            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
                 batch_rgb_map = self.compiled_forward(batch_points, batch_depths, test_timestamp)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
@@ -441,10 +502,10 @@ class PISGPipelineTorch:
         Returns:
         - poses: torch.Tensor of shape (N, 4, 4)
         - focals: torch.Tensor of shape (N)
-        - width: int
-        - height: int
-        - near: float
-        - far: float
+        - width: torch.Tensor of shape (N)
+        - height: torch.Tensor of shape (N)
+        - near: torch.Tensor of shape (N)
+        - far: torch.Tensor of shape (N)
         """
 
         if not cameras_paths:
@@ -469,8 +530,12 @@ class PISGPipelineTorch:
         assert len(set(fars)) == 1, f"Error: Inconsistent fars found: {fars}. All cameras must have the same far plane."
         poses = torch.stack([torch.tensor(info["cam_transform"], device=self.device, dtype=self.dtype) for info in camera_infos])
         focals = torch.tensor([info["focal"] * widths[0] / info["aperture"] for info in camera_infos], device=self.device, dtype=self.dtype)
+        widths = torch.tensor(widths, device=self.device, dtype=torch.int32)
+        heights = torch.tensor(heights, device=self.device, dtype=torch.int32)
+        nears = torch.tensor(nears, device=self.device, dtype=self.dtype)
+        fars = torch.tensor(fars, device=self.device, dtype=self.dtype)
 
-        return poses, focals, widths[0], heights[0], nears[0], fars[0]
+        return poses, focals, widths, heights, nears, fars
 
 
 def test_pipeline(rank, gpu_size):
