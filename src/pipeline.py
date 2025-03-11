@@ -585,7 +585,8 @@ def export_density(rank, gpu_size):
 
     pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
 
-    for _ in range(120):
+    import tqdm
+    for _ in tqdm.trange(120):
         if _ % 2 == rank:
             pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/den")
 
@@ -605,5 +606,5 @@ if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
     # train(target_device=torch.device("cuda:0"))
-    run_multidevice(test_pipeline)
+    # run_multidevice(test_pipeline)
     run_multidevice(export_density)
