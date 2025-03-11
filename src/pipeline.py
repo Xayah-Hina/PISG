@@ -25,6 +25,7 @@ Performance:
 
 """
 
+
 def find_relative_paths(relative_path_list):
     current_dir = Path.cwd()
     search_dirs = [current_dir, current_dir.parent, current_dir.parent.parent]
