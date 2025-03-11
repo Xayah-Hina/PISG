@@ -242,6 +242,7 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     - u: torch.Tensor of shape (H, W)
     - v: torch.Tensor of shape (H, W)
     """
+    focals = focals.to(device)
     u, v = torch.meshgrid(torch.linspace(0, width - 1, width, device=device, dtype=dtype), torch.linspace(0, height - 1, height, device=device, dtype=dtype), indexing='xy')  # (H, W), (H, W)
     if randomize:
         du, dv = torch.rand_like(u), torch.rand_like(v)  # (H, W), (H, W)
@@ -421,11 +422,15 @@ class PISGPipelineTorch:
         height = height * self.ratio
 
         import tqdm
-        for _1 in tqdm.trange(0, 1):
-            dirs, u, v = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=True, device=self.device, dtype=self.dtype)
-            videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
+        for _1 in tqdm.trange(0, 5):
+            losses = []  # 记录 loss
+            temp_losses = []  # 用于计算平均 loss
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
+            dirs, u, v = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=True, device=torch.device("cpu"), dtype=self.dtype)
+            videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v).to(self.device)  # (T, V, H, W, C)
+            dirs = dirs.to(self.device)
+
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype)):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
                 batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, batch_time, poses, focals, width, height, near, far)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
@@ -433,6 +438,29 @@ class PISGPipelineTorch:
                 loss_image.backward()
                 self.optimizer.step()
                 self.scheduler.step()
+
+                # 记录 loss
+                temp_losses.append(loss_image.item())
+
+                # 每 100 次计算平均 loss
+                if (_2 + 1) % 100 == 0:
+                    avg_loss = sum(temp_losses) / len(temp_losses)
+                    losses.append(avg_loss)
+                    allocated_mem = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
+                    reserved_mem = torch.cuda.memory_reserved(self.device) / (1024 ** 2)  # MB
+                    tqdm.tqdm.write(f"Iteration {_2+1}: Avg Loss = {avg_loss:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB")
+                    temp_losses.clear()  # 清空
+
+            import matplotlib.pyplot as plt
+
+            # 训练结束后绘制 loss 曲线
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(100, 100 * len(losses) + 1, 100), losses, marker='o', linestyle='-')
+            plt.xlabel("Iterations")
+            plt.ylabel("Average Loss")
+            plt.title(f"Training Loss Over Iterations: {_1}")
+            plt.grid()
+            plt.show()
 
         if save_ckp_path is not None:
             torch.save({
@@ -525,7 +553,6 @@ class PISGPipelineTorch:
         new_H, new_W = int(H * ratio), int(W * ratio)
         videos_resampled = torch.nn.functional.interpolate(videos_permuted, size=(new_H, new_W), mode='bilinear', align_corners=False)
         videos_resampled = videos_resampled.reshape(V, T, C, new_H, new_W).permute(1, 0, 3, 4, 2)
-        videos_resampled = videos_resampled.to(self.device)
 
         return videos_resampled
 
@@ -612,6 +639,6 @@ def train(target_device):
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    # train(target_device=torch.device("cuda:0"))
+    train(target_device=torch.device("cuda:0"))
     # run_multidevice(test_pipeline)
-    run_multidevice(export_density)
+    # run_multidevice(export_density)
