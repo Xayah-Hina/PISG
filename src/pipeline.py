@@ -398,7 +398,14 @@ class PISGPipelineTorch:
                 in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)  # (res * res * res)
                 xyz_normalized_flat = normalize_points(points=xyz_flat, device=self.device, dtype=self.dtype)  # (res * res * res, 3)
                 input_xyzt_flat = torch.cat([xyz_normalized_flat, torch.ones_like(xyz_normalized_flat[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
-                raw_d_flat = self.model(self.encoder(input_xyzt_flat))  # (res * res * res, 1)
+                # batchfy this
+                raw_d_flat_list = []
+                batch_size = 64 * 64 * 64
+                for i in range(0, input_xyzt_flat.shape[0], batch_size):
+                    input_xyzt_flat_batch = input_xyzt_flat[i:i + batch_size]
+                    raw_d_flat_batch = self.model(self.encoder(input_xyzt_flat_batch))
+                    raw_d_flat_list.append(raw_d_flat_batch)
+                raw_d_flat = torch.cat(raw_d_flat_list, dim=0)  # (res * res * res, 1)
                 in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (res * res * res, 1)
                 raw_d_flat = raw_d_flat * in_all_frustum_mask_float
                 raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
@@ -588,7 +595,7 @@ def export_density(rank, gpu_size):
     import tqdm
     for _ in tqdm.trange(120):
         if _ % 2 == rank:
-            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/den")
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=128, output_dir="output/den")
 
 
 def run_multidevice(func):
