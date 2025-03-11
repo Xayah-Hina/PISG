@@ -49,6 +49,7 @@ training_videos = [
     "data/PISG/scene1/right.mp4",
     "data/PISG/scene1/back.mp4",
     "data/PISG/scene1/top.mp4",
+    "data/PISG/scene1/bottom.mp4",
 ]
 
 camera_calibrations = [
@@ -56,6 +57,7 @@ camera_calibrations = [
     "data/PISG/scene1/cam_right.npz",
     "data/PISG/scene1/cam_back.npz",
     "data/PISG/scene1/cam_top.npz",
+    "data/PISG/scene1/cam_bottom.npz",
 ]
 
 find_relative_paths(training_videos)
