@@ -44,7 +44,8 @@ def find_relative_paths(relative_path_list):
             raise FileNotFoundError(f"file not found: {relative_path}")
 
 
-training_videos = [
+# Our Scene 1
+training_videos_scene1 = [
     "data/PISG/scene1/front.mp4",
     "data/PISG/scene1/right.mp4",
     "data/PISG/scene1/back.mp4",
@@ -52,13 +53,33 @@ training_videos = [
     "data/PISG/scene1/bottom.mp4",
 ]
 
-camera_calibrations = [
+camera_calibrations_scene1 = [
     "data/PISG/scene1/cam_front.npz",
     "data/PISG/scene1/cam_right.npz",
     "data/PISG/scene1/cam_back.npz",
     "data/PISG/scene1/cam_top.npz",
     "data/PISG/scene1/cam_bottom.npz",
 ]
+
+# HyFluid Scene
+training_videos_hyfluid = [
+    "data/hyfluid/train00.mp4",
+    "data/hyfluid/train01.mp4",
+    "data/hyfluid/train02.mp4",
+    "data/hyfluid/train03.mp4",
+    "data/hyfluid/train04.mp4",
+]
+
+camera_calibrations_hyfluid = [
+    "data/hyfluid/cam_train00.npz",
+    "data/hyfluid/cam_train01.npz",
+    "data/hyfluid/cam_train02.npz",
+    "data/hyfluid/cam_train03.npz",
+    "data/hyfluid/cam_train04.npz",
+]
+
+training_videos = training_videos_hyfluid
+camera_calibrations = camera_calibrations_hyfluid
 
 find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
@@ -450,7 +471,7 @@ class PISGPipelineTorch:
                     losses.append(avg_loss)
                     allocated_mem = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
                     reserved_mem = torch.cuda.memory_reserved(self.device) / (1024 ** 2)  # MB
-                    tqdm.tqdm.write(f"Iteration {_2+1}: Avg Loss = {avg_loss:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB")
+                    tqdm.tqdm.write(f"Iteration {_2 + 1}: Avg Loss = {avg_loss:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB")
                     temp_losses.clear()  # 清空
 
             import matplotlib.pyplot as plt
