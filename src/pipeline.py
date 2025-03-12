@@ -3,7 +3,6 @@ import torchvision.io as io
 import torch.multiprocessing as mp
 import os
 import math
-import random
 from pathlib import Path
 
 from model.model_hyfluid import NeRFSmall
@@ -60,6 +59,8 @@ camera_calibrations_scene1 = [
     "data/PISG/scene1/cam_top.npz",
     "data/PISG/scene1/cam_bottom.npz",
 ]
+scene_min_scene1 = [-20.0, -20.0, -20.0]
+scene_max_scene1 = [20.0, 20.0, 20.0]
 
 # HyFluid Scene
 training_videos_hyfluid = [
@@ -69,6 +70,8 @@ training_videos_hyfluid = [
     "data/hyfluid/train03.mp4",
     "data/hyfluid/train04.mp4",
 ]
+scene_min_hyfluid = [-1, -1, -1]
+scene_max_hyfluid = [1, 1, 1]
 
 camera_calibrations_hyfluid = [
     "data/hyfluid/cam_train00.npz",
@@ -80,6 +83,8 @@ camera_calibrations_hyfluid = [
 
 training_videos = training_videos_hyfluid
 camera_calibrations = camera_calibrations_hyfluid
+scene_min_current = scene_min_hyfluid
+scene_max_current = scene_max_hyfluid
 
 find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
@@ -244,8 +249,8 @@ def normalize_points(points: torch.Tensor, device: torch.device, dtype: torch.dt
     - points_normalized: torch.Tensor of shape (..., 3)
     """
 
-    scene_min = torch.tensor([-20.0, -20.0, -20.0], device=device, dtype=dtype)
-    scene_max = torch.tensor([20.0, 20.0, 20.0], device=device, dtype=dtype)
+    scene_min = torch.tensor(scene_min_current, device=device, dtype=dtype)
+    scene_max = torch.tensor(scene_max_current, device=device, dtype=dtype)
     points_normalized = (points - scene_min) / (scene_max - scene_min)
     return points_normalized
 
