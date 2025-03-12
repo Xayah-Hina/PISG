@@ -530,7 +530,7 @@ class PISGPipelineTorch:
         self.model.load_state_dict(ckpt['model_state_dict'])
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
 
-        den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+        den = self.compiled_query_density_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
         np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
 
     def query_rgb_map_skip_ghost(self, batch_input_xyzt_flat: torch.Tensor, batch_depths: torch.Tensor, in_all_frustum_mask: torch.Tensor):
