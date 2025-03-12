@@ -398,7 +398,7 @@ class PISGPipelineTorch:
         self.dtype = torch_dtype
         self.encoder_num_scale = 16
         self.depth = 192
-        self.ratio = 1.0
+        self.ratio = 0.5
 
         self.encoder = HashEncoderNative(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
@@ -446,6 +446,7 @@ class PISGPipelineTorch:
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
         masks = get_filter_mask(video_tensor=videos_data)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        focals = focals * self.ratio
         width = width * self.ratio
         height = height * self.ratio
 
@@ -529,6 +530,9 @@ class PISGPipelineTorch:
         self.encoder.load_state_dict(ckpt['encoder_state_dict'])
         self.model.load_state_dict(ckpt['model_state_dict'])
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        focals = focals * self.ratio
+        width = width * self.ratio
+        height = height * self.ratio
 
         den = self.compiled_query_density_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
         np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
