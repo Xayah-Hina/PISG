@@ -39,6 +39,9 @@ class HoudiniExecutor:
 
         return loss_image.item()
 
+    def sample_grid(self, resolution, target_timestamp):
+        den = self.pipeline.compiled_query_density_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=self.poses, focals=self.focals, width=self.width, height=self.height, near=self.near, far=self.far)
+        return den
 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
