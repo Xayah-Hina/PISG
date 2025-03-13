@@ -38,3 +38,9 @@ class HoudiniExecutor:
         self.pipeline.scheduler.step()
 
         return loss_image.item()
+
+
+if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
+    executor = HoudiniExecutor(batch_size=1024, torch_device=torch.device("cuda:0"), torch_dtype=torch.float32)
+    print(f"loss: {executor.forward_1_iter()}")
