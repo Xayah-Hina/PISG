@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
-from model.encoder_hyfluid import HashEncoderNative
+from model.encoder_hyfluid import HashEncoderNativeFasterBackward
 
 """
 Performance:
@@ -23,6 +23,32 @@ Performance:
 - 1024 + 1.0 ( with mask filter ): 3721it, 62.70it/s, 100s, 37.4GB
 
 """
+
+
+def _get_minibatch_jacobian(y, x):
+    """Computes the Jacobian of y wrt x assuming minibatch-mode.
+    Args:
+      y: (N, ...) with a total of D_y elements in ...
+      x: (N, ...) with a total of D_x elements in ...
+    Returns:
+      The minibatch Jacobian matrix of shape (N, D_y, D_x)
+    """
+    assert y.shape[0] == x.shape[0]
+    y = y.view(y.shape[0], -1)
+    # Compute Jacobian row by row.
+    jac = []
+    for j in range(y.shape[1]):
+        dy_j_dx = torch.autograd.grad(
+            y[:, j],
+            x,
+            torch.ones_like(y[:, j], device=y.get_device()),
+            retain_graph=True,
+            create_graph=True,
+        )[0].view(x.shape[0], -1)
+
+        jac.append(torch.unsqueeze(dy_j_dx, 1))
+    jac = torch.cat(jac, 1)
+    return jac
 
 
 def find_relative_paths(relative_path_list):
@@ -387,7 +413,7 @@ def sample_points(x_min: float, x_max: float, y_min: float, y_max: float, z_min:
     grids = torch.stack([xs, ys, zs], dim=-1)
     return grids
 
-
+import time
 class PISGPipelineTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
@@ -400,11 +426,11 @@ class PISGPipelineTorch:
         self.depth = 192
         self.ratio = 0.5
 
-        self.encoder = HashEncoderNative(device=self.device).to(self.device)
+        self.encoder = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
         self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
 
-        self.encoder_v = HashEncoderNative(device=self.device).to(self.device)
+        self.encoder_v = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
         self.model_v = NeRFSmallPotential(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2, use_f=False).to(self.device)
         self.optimizer_v = torch.optim.RAdam([{'params': self.model_v.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder_v.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
 
@@ -414,20 +440,52 @@ class PISGPipelineTorch:
         self.scheduler_v = torch.optim.lr_scheduler.ExponentialLR(self.optimizer_v, gamma=gamma)
 
         def volume_render(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+
+            start_time = time.time()
+
             batch_points_flat = batch_points.reshape(-1, 3)  # (batch_size * depth, 3)
             in_frustum_mask = is_points_in_frustum(points=batch_points_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)
             in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
             batch_points_normalized_flat = normalize_points(points=batch_points_flat, device=self.device, dtype=self.dtype)  # (batch_size * depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized_flat, batch_time.expand(batch_points_normalized_flat[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map, raw_flat = self.query_rgb_map_skip_ghost(batch_input_xyzt_flat=batch_input_xyzt_flat, batch_depths=batch_depths, in_all_frustum_mask=in_all_frustum_mask)
 
-            def func(xyzt):
-                return self.model(self.encoder(xyzt))
+
+            def func(x):
+                return self.model(x)
+
+            end_time = time.time()
+            execution_time = end_time - start_time
+            print(f"front代码执行时间: {execution_time:.6f} 秒")
+            start_time = time.time()
+
 
             batch_input_xyzt_flat.requires_grad = True
-            raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(batch_input_xyzt_flat))
-            jacobian = torch.func.vmap(torch.func.jacrev(func))(batch_input_xyzt_flat)
-            print(jacobian.shape)
+            hidden = self.encoder(batch_input_xyzt_flat)
+            raw_flat = self.model(hidden)  # (batch_size * depth, 4)
+            jac = torch.func.vmap(torch.func.jacrev(func))(hidden)
+            jac_x = _get_minibatch_jacobian(hidden, batch_input_xyzt_flat)
+            jac = jac @ jac_x
+
+            end_time = time.time()
+            execution_time = end_time - start_time
+            print(f"jac代码执行时间: {execution_time:.6f} 秒")
+
+
+            in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (N,1)
+            raw_flat = raw_flat * in_all_frustum_mask_float
+            raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
+            rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
+            alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
+            weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+            batch_rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+
+            # def func(xyzt):
+            #     return self.model(self.encoder(xyzt))
+
+            # batch_input_xyzt_flat.requires_grad = True
+            # raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(batch_input_xyzt_flat))
+            # jacobian = torch.func.vmap(torch.func.jacrev(func))(batch_input_xyzt_flat)
+            # print(jacobian.shape)
 
 
 
@@ -512,6 +570,8 @@ class PISGPipelineTorch:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
                 'model_state_dict': self.model.state_dict(),
+                'encoder_v_state_dict': self.encoder_v.state_dict(),
+                'model_v_state_dict': self.model_v.state_dict(),
             }, save_ckp_path)
 
     def test(self, save_ckp_path, target_timestamp: int, output_dir="output"):
