@@ -823,16 +823,16 @@ if __name__ == '__main__':
     K = np.array([[FOCAL_float, 0, 0.5 * W_int], [0, FOCAL_float, 0.5 * H_int], [0, 0, 1]])
 
     ############################## Load Encoder ##############################
-    from model.encoder_hyfluid import HashEncoderHyFluid
+    from model.encoder_hyfluid import HashEncoderNative
     from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
     from model.radam import RAdam
 
     max_res = np.array([args.finest_resolution, args.finest_resolution, args.finest_resolution, args.finest_resolution_t])
     min_res = np.array([args.base_resolution, args.base_resolution, args.base_resolution, args.base_resolution_t])
-    ENCODER_gpu = HashEncoderHyFluid(max_res=max_res, min_res=min_res, num_scales=args.num_levels, max_params=2 ** args.log2_hashmap_size).to(device)
+    ENCODER_gpu = HashEncoderNative().to(device)
     max_res_v = np.array([args.finest_resolution_v, args.finest_resolution_v, args.finest_resolution_v, args.finest_resolution_v_t])
     min_res_v = np.array([args.base_resolution_v, args.base_resolution_v, args.base_resolution_v, args.base_resolution_v_t])
-    ENCODER_v_gpu = HashEncoderHyFluid(max_res=max_res_v, min_res=min_res_v, num_scales=args.num_levels, max_params=2 ** args.log2_hashmap_size).to(device)
+    ENCODER_v_gpu = HashEncoderNative().to(device)
     ############################## Load Encoder ##############################
 
     ############################## Load Model ##############################
@@ -841,13 +841,13 @@ if __name__ == '__main__':
                           geo_feat_dim=15,
                           num_layers_color=2,
                           hidden_dim_color=16,
-                          input_ch=ENCODER_gpu.num_scales * 2).to(device)
+                          input_ch=ENCODER_gpu.num_levels * 2).to(device)
     MODEL_v_gpu = NeRFSmallPotential(num_layers=args.vel_num_layers,
                                      hidden_dim=64,
                                      geo_feat_dim=15,
                                      num_layers_color=2,
                                      hidden_dim_color=16,
-                                     input_ch=ENCODER_v_gpu.num_scales * 2,
+                                     input_ch=ENCODER_v_gpu.num_levels * 2,
                                      use_f=args.use_f).to(device)
     ############################## Load Model ##############################
 
