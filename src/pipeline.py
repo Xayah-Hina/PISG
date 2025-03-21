@@ -59,8 +59,8 @@ camera_calibrations_scene1 = [
     "data/PISG/scene1/cam_top.npz",
     "data/PISG/scene1/cam_bottom.npz",
 ]
-scene_min_scene1 = [-20.0, -20.0, -20.0]
-scene_max_scene1 = [20.0, 20.0, 20.0]
+scene_min_scene1 = [-14.4271, -11.1562, -15.7799]
+scene_max_scene1 = [11.8115, 23.5037, 12.5602]
 
 # HyFluid Scene
 training_videos_hyfluid = [
@@ -70,8 +70,8 @@ training_videos_hyfluid = [
     "data/hyfluid/train03.mp4",
     "data/hyfluid/train04.mp4",
 ]
-scene_min_hyfluid = [-1, -1, -1]
-scene_max_hyfluid = [1, 1, 1]
+scene_min_hyfluid = [-0.132113, -0.103114, -0.753138]
+scene_max_hyfluid = [0.773877, 0.99804, 0.186818]
 
 camera_calibrations_hyfluid = [
     "data/hyfluid/cam_train00.npz",
@@ -617,7 +617,7 @@ class PISGPipelineTorch:
             valid_paths.append(_path)
 
         import numpy as np
-        camera_infos = [np.load(path) for path in cameras_paths]
+        camera_infos = [np.load(path) for path in valid_paths]
         widths = [int(info["width"]) for info in camera_infos]
         assert len(set(widths)) == 1, f"Error: Inconsistent widths found: {widths}. All cameras must have the same resolution."
         heights = [int(info["height"]) for info in camera_infos]
