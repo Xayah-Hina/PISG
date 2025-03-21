@@ -674,5 +674,5 @@ if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
     train(target_device=torch.device("cuda:0"))
-    # run_multidevice(test_pipeline)
+    # run_multidevice(inference_pipeline)
     # run_multidevice(export_density)
