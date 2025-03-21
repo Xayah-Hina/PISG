@@ -158,8 +158,13 @@ class HashEncoderNativeFasterBackward(torch.nn.Module):
         self.primes = torch.tensor([1, 2654435761, 805459861, 3674653429], device=device)
         self.hash_table_size = 2 ** log2_hashmap_size
 
-        levels = torch.arange(self.num_levels)
-        self.growth_factor = np.exp((np.log(self.max_res) - np.log(self.min_res)) / (self.num_levels - 1)) if self.num_levels > 1 else 1
+        levels = torch.arange(self.num_levels, device=device, dtype=torch.int32)
+        self.growth_factor = torch.exp(
+            (torch.log(torch.tensor(self.max_res, dtype=torch.float32, device=device)) -
+             torch.log(torch.tensor(self.min_res, dtype=torch.float32, device=device))) /
+            (self.num_levels - 1)
+        ) if self.num_levels > 1 else torch.tensor(1.0, dtype=torch.float32, device=device)
+
         self.scalings = torch.floor(min_res * self.growth_factor ** levels)
         self.hash_offset = levels * self.hash_table_size
 
@@ -173,12 +178,12 @@ class HashEncoderNativeFasterBackward(torch.nn.Module):
         x = torch.bitwise_xor(x, in_tensor[..., 2])
         x = torch.bitwise_xor(x, in_tensor[..., 3])
         x %= self.hash_table_size
-        x += self.hash_offset.to(x.device)
+        x += self.hash_offset
         return x
 
     def forward(self, xyzt):
         xyzt = xyzt[..., None, :]
-        scaled = xyzt * self.scalings.view(-1, 1).to(xyzt.device)
+        scaled = xyzt * self.scalings.view(-1, 1)
         scaled_c = torch.ceil(scaled).type(torch.int32)
         scaled_f = torch.floor(scaled).type(torch.int32)
         offset = scaled - scaled_f
