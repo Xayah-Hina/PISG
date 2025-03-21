@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 from model.model_hyfluid import NeRFSmall
-from model.encoder_hyfluid import HashEncoderNative
+from model.encoder_hyfluid import HashEncoderNativeFasterBackward
 
 """
 Performance:
@@ -400,7 +400,7 @@ class PISGPipelineTorch:
         self.depth = 192
         self.ratio = 0.5
 
-        self.encoder = HashEncoderNative(device=self.device).to(self.device)
+        self.encoder = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
         self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
 
@@ -543,7 +543,9 @@ class PISGPipelineTorch:
         raw_flat = raw_flat * in_all_frustum_mask_float
         raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
-        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_depths)
+        batch_dists = batch_depths[..., 1:] - batch_depths[..., :-1]
+        batch_dists_full = torch.cat([batch_dists, torch.full_like(batch_dists[..., :1], 1e10)], dim=-1).expand_as(raw[..., -1])
+        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_dists_full)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
         batch_rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
         return batch_rgb_map
@@ -634,7 +636,7 @@ class PISGPipelineTorch:
         return poses, focals, widths, heights, nears, fars
 
 
-def test_pipeline(rank, gpu_size):
+def inference_pipeline(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
