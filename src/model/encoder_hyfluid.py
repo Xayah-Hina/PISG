@@ -143,7 +143,7 @@ class HashEncoderNativeFasterBackward(torch.nn.Module):
             self,
             num_levels: int = 16,
             min_res: int = 16,
-            max_res: int = 256,
+            max_res: int = 128,
             log2_hashmap_size: int = 19,
             features_per_level: int = 2,
             hash_init_scale: float = 0.001,
