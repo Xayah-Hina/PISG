@@ -1,16 +1,28 @@
-import typing
-
 import torch
 import torchvision.io as io
 import torch.multiprocessing as mp
 import os
 import math
-import random
-from torch.func import jacrev, vmap
 from pathlib import Path
 
-from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
-from model.encoder_hyfluid import HashEncoderNative
+from model.model_hyfluid import NeRFSmall
+from model.encoder_hyfluid import HashEncoderNativeFasterBackward
+
+"""
+Performance:
+
+- 1024 + 1.0 - 8100it, 62.30it/s, 134s, 37.4GB
+
+- 2048 + 1.0 - 4050it, 37.40it/s, 110s, 37.4GB
+- 512 + 1.0 - 16200it, 90.26it/s, , 181s, 37.4GB
+- 256 + 1.0 - 32400it, 128.83it/s, 254s, 37.4GB
+- 128 + 1.0 - 64800it, 142.91it/s, 461s, 37.4GB
+
+- 1024 + 0.5 - 2025it, 66.37it/s, 45s, 12.5GB
+
+- 1024 + 1.0 ( with mask filter ): 3721it, 62.70it/s, 100s, 37.4GB
+
+"""
 
 
 def find_relative_paths(relative_path_list):
@@ -31,85 +43,51 @@ def find_relative_paths(relative_path_list):
             raise FileNotFoundError(f"file not found: {relative_path}")
 
 
-training_videos = [
+# Our Scene 1
+training_videos_scene1 = [
     "data/PISG/scene1/front.mp4",
     "data/PISG/scene1/right.mp4",
     "data/PISG/scene1/back.mp4",
     "data/PISG/scene1/top.mp4",
+    "data/PISG/scene1/bottom.mp4",
 ]
 
-camera_calibrations = [
+camera_calibrations_scene1 = [
     "data/PISG/scene1/cam_front.npz",
     "data/PISG/scene1/cam_right.npz",
     "data/PISG/scene1/cam_back.npz",
     "data/PISG/scene1/cam_top.npz",
+    "data/PISG/scene1/cam_bottom.npz",
 ]
+scene_min_scene1 = [-14.4271, -11.1562, -15.7799]
+scene_max_scene1 = [11.8115, 23.5037, 12.5602]
+
+# HyFluid Scene
+training_videos_hyfluid = [
+    "data/hyfluid/train00.mp4",
+    "data/hyfluid/train01.mp4",
+    "data/hyfluid/train02.mp4",
+    "data/hyfluid/train03.mp4",
+    "data/hyfluid/train04.mp4",
+]
+scene_min_hyfluid = [-0.132113, -0.103114, -0.753138]
+scene_max_hyfluid = [0.773877, 0.99804, 0.186818]
+
+camera_calibrations_hyfluid = [
+    "data/hyfluid/cam_train00.npz",
+    "data/hyfluid/cam_train01.npz",
+    "data/hyfluid/cam_train02.npz",
+    "data/hyfluid/cam_train03.npz",
+    "data/hyfluid/cam_train04.npz",
+]
+
+training_videos = training_videos_hyfluid
+camera_calibrations = camera_calibrations_hyfluid
+scene_min_current = scene_min_hyfluid
+scene_max_current = scene_max_hyfluid
 
 find_relative_paths(training_videos)
 find_relative_paths(camera_calibrations)
-
-
-def _get_minibatch_jacobian(y, x):
-    """Computes the Jacobian of y wrt x assuming minibatch-mode.
-    Args:
-      y: (N, ...) with a total of D_y elements in ...
-      x: (N, ...) with a total of D_x elements in ...
-    Returns:
-      The minibatch Jacobian matrix of shape (N, D_y, D_x)
-    """
-    assert y.shape[0] == x.shape[0]
-    y = y.view(y.shape[0], -1)
-    # Compute Jacobian row by row.
-    jac = []
-    for j in range(y.shape[1]):
-        dy_j_dx = torch.autograd.grad(
-            y[:, j],
-            x,
-            torch.ones_like(y[:, j], device=y.get_device()),
-            retain_graph=True,
-            create_graph=True,
-        )[0].view(x.shape[0], -1)
-
-        jac.append(torch.unsqueeze(dy_j_dx, 1))
-    jac = torch.cat(jac, 1)
-    return jac
-
-
-def PDE_EQs(D_t, D_x, D_y, D_z, U, F, U_t=None, U_x=None, U_y=None, U_z=None, detach=False):
-    eqs = []
-    dts = [D_t]
-    dxs = [D_x]
-    dys = [D_y]
-    dzs = [D_z]
-
-    F = torch.cat([torch.zeros_like(F[:, :1]), F], dim=1) * 0  # (N,4)
-    u, v, w = U.split(1, dim=-1)  # (N,1)
-    F_t, F_x, F_y, F_z = F.split(1, dim=-1)  # (N,1)
-    dfs = [F_t, F_x, F_y, F_z]
-
-    if None not in [U_t, U_x, U_y, U_z]:
-        dts += U_t.split(1, dim=-1)  # [d_t, u_t, v_t, w_t] # (N,1)
-        dxs += U_x.split(1, dim=-1)  # [d_x, u_x, v_x, w_x]
-        dys += U_y.split(1, dim=-1)  # [d_y, u_y, v_y, w_y]
-        dzs += U_z.split(1, dim=-1)  # [d_z, u_z, v_z, w_z]
-    else:
-        dfs = [F_t]
-
-    for i, (dt, dx, dy, dz, df) in enumerate(zip(dts, dxs, dys, dzs, dfs)):
-        if i == 0:
-            _e = dt + (u * dx + v * dy + w * dz) + df
-        else:
-            if detach:
-                _e = dt + (u.detach() * dx + v.detach() * dy + w.detach() * dz) + df
-            else:
-                _e = dt + (u * dx + v * dy + w * dz) + df
-        eqs += [_e]
-
-    if None not in [U_t, U_x, U_y, U_z]:
-        # eqs += [ u_x + v_y + w_z ]
-        eqs += [dxs[1] + dys[2] + dzs[3]]
-
-    return eqs
 
 
 def resample_frames(frames: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
@@ -182,6 +160,60 @@ def sample_frustum(dirs: torch.Tensor, poses: torch.Tensor, near: float, far: fl
         yield batch_points, batch_depths, batch_indices
 
 
+def sample_frustum_with_mask(dirs: torch.Tensor, poses: torch.Tensor, mask: torch.Tensor, near: float, far: float, depth: int, batch_size: int, randomize: bool, device: torch.device, dtype: torch.dtype):
+    """
+    Sample points in the frustum of each camera with mask filtering.
+
+    Args:
+    - dirs: torch.Tensor of shape (N, H, W, 3)
+    - poses: torch.Tensor of shape (N, 4, 4)
+    - mask: torch.Tensor of shape (N, 4)
+    - near: float
+    - far: float
+    - depth: int
+    - batch_size: int
+    - randomize: bool
+
+    Yields:
+    - points: torch.Tensor of shape (batch_size, depth, 3)
+    """
+
+    N, H, W = dirs.shape[:3]
+    num_origin = N * H * W
+
+    rays_d = torch.einsum('nij,nhwj->nhwi', poses[:, :3, :3], dirs)  # (N, H, W, 3)
+    rays_o = poses[:, None, None, :3, 3].expand(rays_d.shape)  # (N, H, W, 3)
+
+    rays_d = run_filter1(rays_d, mask)
+    rays_o = run_filter1(rays_o, mask)
+
+    indices_origin = torch.arange(num_origin, device=device)  # (N*H*W)
+    indices_origin_shaped = indices_origin.reshape(N, H, W, 1)
+    indices_filtered = run_filter1(indices_origin_shaped, mask).flatten()  # (filtered)
+
+    num_filtered = rays_d.shape[0]
+    if randomize:
+        indices_inner = torch.randperm(num_filtered, device=device)  # (N*H*W)
+    else:
+        indices_inner = torch.arange(num_filtered, device=device)  # (N*H*W)
+
+    depths = torch.linspace(near, far, steps=depth, device=device, dtype=dtype).unsqueeze(0)  # (1, depth)
+    for i in range(0, num_filtered, batch_size):
+        idx = indices_inner[i:i + batch_size]
+        batch_rays_o = rays_o[idx]  # (batch_size, 3)
+        batch_rays_d = rays_d[idx]  # (batch_size, 3)
+
+        batch_depths = depths.clone()
+        if randomize:
+            midpoints = (depths[:, :-1] + depths[:, 1:]) / 2.0
+            noise = (torch.rand_like(midpoints) - 0.5) * (far - near) / depth
+            batch_depths[:, :-1] = midpoints + noise
+
+        batch_points = batch_rays_o[:, None, :] + batch_rays_d[:, None, :] * batch_depths[:, :, None]  # (batch_size, depth, 3)
+        batch_indices = indices_filtered[idx]
+        yield batch_points, batch_depths, batch_indices
+
+
 def sample_random_frame(videos_data: torch.Tensor, batch_indices: torch.Tensor, device: torch.device, dtype: torch.dtype):
     """
     Sample a random frame from the given videos data.
@@ -194,12 +226,14 @@ def sample_random_frame(videos_data: torch.Tensor, batch_indices: torch.Tensor, 
     - batch_time: torch.Tensor of shape (1)
     - batch_target_pixels: torch.Tensor of shape (batch_size, C)
     """
-    frame = random.uniform(0, videos_data.shape[0] - 1)
-    frame_floor, frame_ceil, frames_alpha = int(frame), int(frame) + 1, frame - int(frame)
+    frame = torch.rand((), device=device, dtype=dtype) * (videos_data.shape[0] - 1)
+    frame_floor = torch.floor(frame).long()
+    frame_ceil = frame_floor + 1
+    frames_alpha = frame - frame_floor.to(frame.dtype)
     target_frame = (1 - frames_alpha) * videos_data[frame_floor] + frames_alpha * videos_data[frame_ceil]  # (V * H * W, C)
     target_frame = target_frame.reshape(-1, 3)
     batch_target_pixels = target_frame[batch_indices]  # (batch_size, C)
-    batch_time = torch.tensor(frame / (videos_data.shape[0] - 1), device=device, dtype=dtype)
+    batch_time = frame / (videos_data.shape[0] - 1)
 
     return batch_time, batch_target_pixels
 
@@ -215,8 +249,8 @@ def normalize_points(points: torch.Tensor, device: torch.device, dtype: torch.dt
     - points_normalized: torch.Tensor of shape (..., 3)
     """
 
-    scene_min = torch.tensor([-20.0, -20.0, -20.0], device=device, dtype=dtype)
-    scene_max = torch.tensor([20.0, 20.0, 20.0], device=device, dtype=dtype)
+    scene_min = torch.tensor(scene_min_current, device=device, dtype=dtype)
+    scene_max = torch.tensor(scene_max_current, device=device, dtype=dtype)
     points_normalized = (points - scene_min) / (scene_max - scene_min)
     return points_normalized
 
@@ -236,6 +270,7 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     - u: torch.Tensor of shape (H, W)
     - v: torch.Tensor of shape (H, W)
     """
+    focals = focals.to(device)
     u, v = torch.meshgrid(torch.linspace(0, width - 1, width, device=device, dtype=dtype), torch.linspace(0, height - 1, height, device=device, dtype=dtype), indexing='xy')  # (H, W), (H, W)
     if randomize:
         du, dv = torch.rand_like(u), torch.rand_like(v)  # (H, W), (H, W)
@@ -246,13 +281,114 @@ def shuffle_uv(focals: torch.Tensor, width: int, height: int, randomize: bool, d
     return dirs, u, v
 
 
+def get_filter_mask(video_tensor):
+    # 1. 对通道做any运算，判断每个像素在一帧内是否非0
+    mask_tensor = (video_tensor != 0)
+    frame_mask = mask_tensor.any(dim=-1)  # shape: [120, 4, 1920, 1080]
+
+    # 2. 对帧做any运算，得到每个视频中每个像素是否曾非0
+    video_mask = frame_mask.any(dim=0)  # shape: [4, 1920, 1080]
+
+    # 3. 对于每个视频计算包围矩形
+    bboxes = []
+    for mask in video_mask:
+        coords = mask.nonzero()
+        if coords.numel() == 0:
+            raise AssertionError("All frames are zero.")
+        # nonzero 返回的坐标顺序为 (row, col)，即 (y, x)
+        y_min, x_min = coords.min(dim=0).values
+        y_max, x_max = coords.max(dim=0).values
+        # 调整顺序为 [x_min, x_max, y_min, y_max]
+        bbox = torch.stack([x_min, x_max, y_min, y_max])
+        bboxes.append(bbox)
+    # 堆叠后得到形状为 [videos, 4]
+    return torch.stack(bboxes, dim=0)
+
+
+def run_filter1(dirs: torch.Tensor, mask: torch.Tensor):
+    """
+    Args:
+        dirs: torch.Tensor，形状为 [4, 1920, 1080, 3]，每个视频的方向数据
+        mask: torch.Tensor，形状为 [4, 4]，每一行格式为 [x_min, x_max, y_min, y_max]
+
+    Returns:
+        flattened_dirs: torch.Tensor，形状为 (X, 3)，包含所有视频在对应 bounding box 内的方向数据，经过扁平化
+    """
+    flattened_list = []
+    for d, bbox in zip(dirs, mask):
+        # mask 的每一行为 [x_min, x_max, y_min, y_max]
+        x_min, x_max, y_min, y_max = bbox.tolist()
+        # 注意这里对索引转换为 int，并加 1 以确保包含上界
+        filtered = d[int(y_min):int(y_max) + 1, int(x_min):int(x_max) + 1, :]
+        # 扁平化为 (N, 3) 的形状
+        flattened = filtered.reshape(-1, filtered.shape[-1])
+        flattened_list.append(flattened)
+    # 将所有视频的扁平化 tensor 在第一维上拼接起来
+    flattened_dirs = torch.cat(flattened_list, dim=0)
+    return flattened_dirs
+
+
+def is_points_in_frustum(points, camera_poses, focals, width, height, near, far):
+    """
+    判断 M 个 3D 点是否在 N 个相机的视锥体内
+    points: (M, 3)  ->  M 个 3D 点
+    camera_poses: (N, 4, 4)  ->  N 个相机的 4x4 位姿矩阵
+    focals, width, height, near, far: (N,)  ->  每个相机的参数
+    返回: (M, N)  ->  M 个点是否在 N 个相机视锥体内的布尔张量
+    """
+
+    def perspective_matrix(focals, width, height, near, far):
+        """ 计算 N 个相机的透视投影矩阵 (N, 4, 4) """
+        N = focals.shape[0]
+        P = torch.zeros((N, 4, 4), device=focals.device)
+
+        P[:, 0, 0] = 2 * focals / width
+        P[:, 1, 1] = 2 * focals / height
+        P[:, 2, 2] = -(far + near) / (far - near)
+        P[:, 2, 3] = -2 * far * near / (far - near)
+        P[:, 3, 2] = -1
+
+        return P
+
+    N = camera_poses.shape[0]
+    M = points.shape[0]
+
+    # 计算 N 个透视投影矩阵 (N, 4, 4)
+    P = perspective_matrix(focals, width, height, near, far)
+
+    # 计算 N 个视图矩阵 (N, 4, 4)
+    V = torch.inverse(camera_poses)
+
+    # 扩展 M 个点为 (M, 4) 的齐次坐标
+    ones = torch.ones((M, 1), device=points.device)
+    points_h = torch.cat([points, ones], dim=-1).unsqueeze(0)  # (1, M, 4)
+
+    # 变换点到相机坐标系 (N, M, 4)
+    points_cam = torch.einsum('nij,mj->nmi', V, points_h.squeeze(0))
+
+    # 变换点到裁剪空间 (N, M, 4)
+    points_clip = torch.einsum('nij,nmj->nmi', P, points_cam)
+
+    # 进行透视除法 (N, M, 3)
+    points_ndc = points_clip[:, :, :3] / points_clip[:, :, 3].unsqueeze(-1)
+
+    # 检查是否在 NDC 空间 (-1, 1) 内 (M, N)
+    in_frustum = (
+            (points_ndc[:, :, 0] >= -1) & (points_ndc[:, :, 0] <= 1) &  # -1 ≤ x ≤ 1
+            (points_ndc[:, :, 1] >= -1) & (points_ndc[:, :, 1] <= 1) &  # -1 ≤ y ≤ 1
+            (points_ndc[:, :, 2] >= -1) & (points_ndc[:, :, 2] <= 1)  # -1 ≤ z ≤ 1
+    ).T  # 转置以匹配 (M, N)
+
+    return in_frustum
+
+
 def sample_points(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, device: torch.device, dtype: torch.dtype):
     xs, ys, zs = torch.meshgrid([torch.linspace(x_min, x_max, res, device=device, dtype=dtype), torch.linspace(y_min, y_max, res, device=device, dtype=dtype), torch.linspace(z_min, z_max, res, device=device, dtype=dtype)], indexing='ij')
     grids = torch.stack([xs, ys, zs], dim=-1)
     return grids
 
 
-class PISGPipelineVelTorch:
+class PISGPipelineTorch:
     """
     Pipeline for training and testing the PISG model using PyTorch.
     """
@@ -262,187 +398,103 @@ class PISGPipelineVelTorch:
         self.dtype = torch_dtype
         self.encoder_num_scale = 16
         self.depth = 192
-        self.ratio = 1.0
+        self.ratio = 0.5
 
-        self.encoder = HashEncoderNative(max_res=256, device=self.device).to(self.device)
-        self.encoder_v = HashEncoderNative(max_res=128, device=self.device).to(self.device)
+        self.encoder = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
-        self.model_v = NeRFSmallPotential(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2, use_f=False).to(self.device)
         self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
-        self.optimizer_v = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.005, betas=(0.9, 0.99))
 
         target_lr_ratio = 0.1  # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10% 你可以根据需求调整目标比例
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
-        self.scheduler_v = torch.optim.lr_scheduler.ExponentialLR(self.optimizer_v, gamma=gamma)
 
-        def PISG_forward(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
-            batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
-            batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
+        def volume_render(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+            batch_points_flat = batch_points.reshape(-1, 3)  # (batch_size * depth, 3)
+            in_frustum_mask = is_points_in_frustum(points=batch_points_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+            in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
+            batch_points_normalized_flat = normalize_points(points=batch_points_flat, device=self.device, dtype=self.dtype)  # (batch_size * depth, 3)
+            batch_input_xyzt_flat = torch.cat([batch_points_normalized_flat, batch_time.expand(batch_points_normalized_flat[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
+            batch_rgb_map = self.query_rgb_map_skip_ghost(batch_input_xyzt_flat=batch_input_xyzt_flat, batch_depths=batch_depths, in_all_frustum_mask=in_all_frustum_mask)
+            return batch_rgb_map
 
-            return batch_rgb_map, raw_d, batch_input_xyzt_flat
+        self.compiled_volume_render = torch.compile(volume_render, mode="max-autotune")
 
-        def PISG_forward_v(batch_input_xyzt_flat: torch.Tensor, raw_d: torch.Tensor, jacobian: torch.Tensor):
-            raw_vel, raw_f = self.query_velocity(xyzt=batch_input_xyzt_flat)
+        def query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+            with torch.no_grad():
+                xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
+                xyz_flat = xyz.reshape(-1, 3)  # (res * res * res, 3)
+                in_frustum_mask = is_points_in_frustum(points=xyz_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)  # (res * res * res, N)
+                in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)  # (res * res * res)
+                xyz_normalized_flat = normalize_points(points=xyz_flat, device=self.device, dtype=self.dtype)  # (res * res * res, 3)
+                input_xyzt_flat = torch.cat([xyz_normalized_flat, torch.ones_like(xyz_normalized_flat[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
+                # batchfy this
+                raw_d_flat_list = []
+                batch_size = 64 * 64 * 64
+                for i in range(0, input_xyzt_flat.shape[0], batch_size):
+                    input_xyzt_flat_batch = input_xyzt_flat[i:i + batch_size]
+                    raw_d_flat_batch = self.model(self.encoder(input_xyzt_flat_batch))
+                    raw_d_flat_list.append(raw_d_flat_batch)
+                raw_d_flat = torch.cat(raw_d_flat_list, dim=0)  # (res * res * res, 1)
+                in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (res * res * res, 1)
+                raw_d_flat = raw_d_flat * in_all_frustum_mask_float
+                raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
+                return raw_d
 
-            _d_x, _d_y, _d_z, _d_t = jacobian.split(1, dim=1)
-            _u_x, _u_y, _u_z, _u_t = None, None, None, None
-            split_nse = PDE_EQs(_d_t, _d_x, _d_y, _d_z, raw_vel, raw_f, _u_t, _u_x, _u_y, _u_z, detach=False)
-            nse_errors = [torch.mean(torch.square(x - 0.0)) for x in split_nse]
-            split_nse_wei = [0.001]
-            nseloss_fine = 0.0
-            for ei, wi in zip(nse_errors, split_nse_wei):
-                nseloss_fine = ei * wi + nseloss_fine
-
-            tau = 0.0001746864290907979
-            viz_dens_mask = raw_d.detach() > tau
-            vel_norm = raw_vel.norm(dim=-1, keepdim=True)
-            min_vel_mask = vel_norm.detach() < 0.2 * raw_d.detach()
-            vel_reg_mask = min_vel_mask & viz_dens_mask
-            min_vel_reg_map = (0.2 * raw_d - vel_norm) * vel_reg_mask.float()
-            min_vel_reg = min_vel_reg_map.pow(2).mean()
-
-            return nseloss_fine, min_vel_reg
-
-        def PISG_forward_test(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor):
-            batch_points_normalized = normalize_points(points=batch_points, device=self.device, dtype=self.dtype)  # (batch_size, depth, 3)
-            batch_input_xyzt_flat = torch.cat([batch_points_normalized, batch_time.expand(batch_points_normalized[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map, raw_d = self.query_rgb_map(xyzt=batch_input_xyzt_flat, batch_depths=batch_depths)
-            return batch_rgb_map, raw_d
-
-        def PISG_query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
-            xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyz_normalized = normalize_points(points=xyz, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyzt_flat = torch.cat([xyz_normalized, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
-            raw_d_flat = self.model(self.encoder(xyzt_flat))  # (res * res * res, 1)
-            raw_d = raw_d_flat.reshape(res, res, res, 1)  # (res, res, res, 1)
-            return raw_d
-
-        def PISG_query_velocity_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float):
-            xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyz_normalized = normalize_points(points=xyz, device=self.device, dtype=self.dtype)  # (res, res, res, 3)
-            xyzt_flat = torch.cat([xyz_normalized, torch.ones_like(xyz[..., :1]) * time], dim=-1).reshape(-1, 4)  # (res * res * res, 4)
-            raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(xyzt_flat))  # (res * res * res, 3)
-            raw_v = raw_v_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
-            raw_f = raw_f_flat.reshape(res, res, res, 3)  # (res, res, res, 3)
-            return raw_v, raw_f
-
-        self.compiled_forward = torch.compile(PISG_forward)
-        self.compiled_forward_v = torch.compile(PISG_forward_v)
-        # self.compiled_forward = PISG_forward
-        # self.compiled_forward_v = PISG_forward_v
-        self.compiled_forward_test = torch.compile(PISG_forward_test, mode="max-autotune")
-        self.compiled_query_density_grid = torch.compile(PISG_query_density_grid, mode="max-autotune")
-        self.compiled_query_velocity_grid = torch.compile(PISG_query_velocity_grid, mode="max-autotune")
+        self.compiled_query_density_grid = torch.compile(query_density_grid, mode="max-autotune")
 
     def train(self, batch_size, save_ckp_path):
-
-        if save_ckp_path is not None:
-            ckpt = torch.load(save_ckp_path)
-            self.encoder.load_state_dict(ckpt['encoder_state_dict'])
-            self.model.load_state_dict(ckpt['model_state_dict'])
-
-        videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)
+        videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
+        masks = get_filter_mask(video_tensor=videos_data)
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        width, height = int(width * self.ratio), int(height * self.ratio)
+        focals = focals * self.ratio
+        width = width * self.ratio
+        height = height * self.ratio
 
         import tqdm
-        train_iter = 0
-        loss_avg_list, loss_v_avg_list, loss_d2v_avg_list, loss_all_avg_list = [], [], [], []
-        loss_accum, loss_v_accum, loss_d2v_accum, loss_all_accum = 0.0, 0.0, 0.0, 0.0
-        for _1 in tqdm.trange(0, 1):
-            dirs, u, v = shuffle_uv(focals=focals, width=width, height=height, randomize=True, device=self.device, dtype=self.dtype)
-            videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v)  # (T, V, H, W, C)
+        for _1 in tqdm.trange(0, 5):
+            losses = []  # 记录 loss
+            temp_losses = []  # 用于计算平均 loss
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(
-                    tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype), desc="Frustum Sampling")):
+            dirs, u, v = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=True, device=torch.device("cpu"), dtype=self.dtype)
+            videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v).to(self.device)  # (T, V, H, W, C)
+            dirs = dirs.to(self.device)
+
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype)):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map, raw_d, batch_input_xyzt_flat = self.compiled_forward(batch_points, batch_depths, batch_time)
-
-                def func(xyzt):
-                    return self.model(self.encoder(xyzt))
-
-                jacobian = vmap(jacrev(func))(batch_input_xyzt_flat)
-                jacobian = jacobian.squeeze(1).squeeze(1)
-                nseloss_fine, min_vel_reg = self.compiled_forward_v(batch_input_xyzt_flat, raw_d, jacobian)
-
+                batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, batch_time, poses, focals, width, height, near, far)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
-                loss_vel = nseloss_fine
-                loss_d2v = min_vel_reg
-                loss = 10000 * loss_image + 1 * loss_vel + 10 * loss_d2v
                 self.optimizer.zero_grad()
-                self.optimizer_v.zero_grad()
-                loss.backward()
+                loss_image.backward()
                 self.optimizer.step()
-                self.optimizer_v.step()
                 self.scheduler.step()
-                self.scheduler_v.step()
 
-                train_iter += 1
-                loss_accum += loss_image.item()
-                loss_v_accum += loss_vel.item()
-                loss_d2v_accum += loss_d2v.item()
-                loss_all_accum += loss.item()
-                if train_iter % 100 == 0:
-                    loss_avg = loss_accum / 100.0
-                    loss_v_avg = loss_v_accum / 100.0
-                    loss_d2v_avg = loss_d2v_accum / 100.0
-                    loss_all_avg = loss_all_accum / 100.0
-                    loss_avg_list.append(loss_avg)
-                    loss_v_avg_list.append(loss_v_avg)
-                    loss_d2v_avg_list.append(loss_d2v_avg)
-                    loss_all_avg_list.append(loss_all_avg)
-                    loss_accum = 0.0
-                    loss_v_accum = 0.0
-                    loss_d2v_accum = 0.0
-                    loss_all_accum = 0.0
-                    tqdm.tqdm.write(f"Average loss over iterations {train_iter - 99} to {train_iter}: {loss_avg:.8f}, {loss_v_avg:.8f}, {loss_d2v_avg:.8f}, {loss_all_avg:.8f}")
+                # 记录 loss
+                temp_losses.append(loss_image.item())
 
-        import matplotlib.pyplot as plt
+                # 每 100 次计算平均 loss
+                if (_2 + 1) % 100 == 0:
+                    avg_loss = sum(temp_losses) / len(temp_losses)
+                    losses.append(avg_loss)
+                    allocated_mem = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
+                    reserved_mem = torch.cuda.memory_reserved(self.device) / (1024 ** 2)  # MB
+                    tqdm.tqdm.write(f"Iteration {_2 + 1}: Avg Loss = {avg_loss:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB")
+                    temp_losses.clear()  # 清空
 
-        # 绘制 image loss 曲线
-        plt.figure()
-        plt.plot(loss_avg_list, label='Image Loss')
-        plt.title("Average Image Loss")
-        plt.xlabel("Iteration (per 100 iterations)")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
+            import matplotlib.pyplot as plt
 
-        # 绘制 NSE/velocity loss 曲线
-        plt.figure()
-        plt.plot(loss_v_avg_list, label='NSE Loss')
-        plt.title("Average NSE Loss")
-        plt.xlabel("Iteration (per 100 iterations)")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
-
-        # 绘制 velocity regularization (d2v) loss 曲线
-        plt.figure()
-        plt.plot(loss_d2v_avg_list, label='d2v Loss')
-        plt.title("Average d2v Loss")
-        plt.xlabel("Iteration (per 100 iterations)")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
-
-        # 绘制总 loss 曲线
-        plt.figure()
-        plt.plot(loss_all_avg_list, label='Total Loss')
-        plt.title("Average Total Loss")
-        plt.xlabel("Iteration (per 100 iterations)")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
+            # 训练结束后绘制 loss 曲线
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(100, 100 * len(losses) + 1, 100), losses, marker='o', linestyle='-')
+            plt.xlabel("Iterations")
+            plt.ylabel("Average Loss")
+            plt.title(f"Training Loss Over Iterations: {_1}")
+            plt.grid()
+            plt.show()
 
         if save_ckp_path is not None:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
                 'model_state_dict': self.model.state_dict(),
-                'encoder_v_state_dict': self.encoder_v.state_dict(),
-                'model_v_state_dict': self.model_v.state_dict(),
             }, save_ckp_path)
 
     def test(self, save_ckp_path, target_timestamp: int, output_dir="output"):
@@ -452,25 +504,21 @@ class PISGPipelineVelTorch:
 
         ckpt = torch.load(save_ckp_path)
         self.encoder.load_state_dict(ckpt['encoder_state_dict'])
-        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
         self.model.load_state_dict(ckpt['model_state_dict'])
-        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
 
         poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
-        poses, focals, width, height = poses[:1], focals[:1], int(width * self.ratio), int(height * self.ratio)
 
         batch_size = 1024
         test_timestamp = torch.tensor(target_timestamp / 120., device=self.device, dtype=self.dtype)
         import tqdm
         with torch.no_grad():
-            dirs, _, _ = shuffle_uv(focals=focals, width=width, height=height, randomize=False, device=self.device, dtype=self.dtype)
+            dirs, _, _ = shuffle_uv(focals=focals[:1], width=int(width[0].item()), height=int(height[0].item()), randomize=False, device=self.device, dtype=self.dtype)
             rgb_map_list = []
-            for _1, (batch_points, batch_depths, batch_indices) in enumerate(
-                    tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near, far=far, depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
-                batch_rgb_map, _ = self.compiled_forward_test(batch_points, batch_depths, test_timestamp)
+            for _1, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses[:1], near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=False, device=self.device, dtype=self.dtype), desc="Rendering Frame")):
+                batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, test_timestamp, poses, focals, width, height, near, far)
                 rgb_map_list.append(batch_rgb_map.clone())
             rgb_map_flat = torch.cat(rgb_map_list, dim=0)  # (H * W, 3)
-            rgb_map = rgb_map_flat.reshape(height, width, rgb_map_flat.shape[-1])  # (H, W, 3)
+            rgb_map = rgb_map_flat.reshape(height[0].item(), width[0].item(), rgb_map_flat.shape[-1])  # (H, W, 3)
             rgb8 = (255 * np.clip(rgb_map.cpu().numpy(), 0, 1)).astype(np.uint8)  # (H, W, 3)
             imageio.imwrite(os.path.join(output_dir, 'rgb_{:03d}.png'.format(target_timestamp)), rgb8)
 
@@ -480,49 +528,27 @@ class PISGPipelineVelTorch:
 
         ckpt = torch.load(save_ckp_path)
         self.encoder.load_state_dict(ckpt['encoder_state_dict'])
-        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
         self.model.load_state_dict(ckpt['model_state_dict'])
-        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
+        poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        focals = focals * self.ratio
+        width = width * self.ratio
+        height = height * self.ratio
 
-        with torch.no_grad():
-            den = self.compiled_query_density_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0,
-                                                   z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
-            # np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
-            # print(f"Max Element: {den.max().item()}, Mean Element: {den.mean().item()}, Min Element: {den.min().item()} RGB: {self.model.rgb}")
+        den = self.compiled_query_density_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+        np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
 
-            from skimage.filters import threshold_otsu
-            density_np = den.cpu().numpy().flatten()  # 转换为 numpy 数组，并展平成一维
-            tau = threshold_otsu(density_np)  # 使用 Otsu 方法计算阈值
-            mask = den > tau * 0.1
-            # np.savez_compressed(f"{output_dir}/mask_{target_timestamp:03d}.npz", mask=mask.cpu().numpy())
-            print(f"Threshold: {tau}, Mask Sum: {mask.numel()} Mask Not Zero: {mask.sum()}")
-
-    def export_velocity_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
-        import numpy as np
-        os.makedirs(output_dir, exist_ok=True)
-
-        ckpt = torch.load(save_ckp_path)
-        self.encoder.load_state_dict(ckpt['encoder_state_dict'])
-        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
-        self.model.load_state_dict(ckpt['model_state_dict'])
-        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
-
-        with torch.no_grad():
-            vel, f = self.compiled_query_velocity_grid(x_min=-10.0, x_max=10.0, y_min=-5.0, y_max=15.0, z_min=-10.0, z_max=10.0, res=resolution, time=float(target_timestamp / 120.0))
-            np.savez_compressed(f"{output_dir}/velocity_{target_timestamp:03d}.npz", vel=vel.cpu().numpy(), f=f.cpu().numpy())
-
-    def query_rgb_map(self, xyzt: torch.Tensor, batch_depths: torch.Tensor):
-        raw_d_flat = self.model(self.encoder(xyzt))  # (batch_size * depth, 4)
-        raw_d = raw_d_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
+    def query_rgb_map_skip_ghost(self, batch_input_xyzt_flat: torch.Tensor, batch_depths: torch.Tensor, in_all_frustum_mask: torch.Tensor):
+        raw_flat = self.model(self.encoder(batch_input_xyzt_flat))  # (batch_size * depth, 4)
+        in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (N,1)
+        raw_flat = raw_flat * in_all_frustum_mask_float
+        raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
         rgb_trained = torch.ones(3, device=self.device) * (0.6 + torch.tanh(self.model.rgb) * 0.4)
-        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw_d[..., -1]) * batch_depths)
+        batch_dists = batch_depths[..., 1:] - batch_depths[..., :-1]
+        batch_dists_full = torch.cat([batch_dists, torch.full_like(batch_dists[..., :1], 1e10)], dim=-1).expand_as(raw[..., -1])
+        alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_dists_full)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
-        rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
-        return rgb_map, raw_d_flat
-
-    def query_velocity(self, xyzt: torch.Tensor):
-        raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(xyzt))  # (batch_size * depth, 4)
-        return raw_v_flat, raw_f_flat
+        batch_rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
+        return batch_rgb_map
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
@@ -561,7 +587,6 @@ class PISGPipelineVelTorch:
         new_H, new_W = int(H * ratio), int(W * ratio)
         videos_resampled = torch.nn.functional.interpolate(videos_permuted, size=(new_H, new_W), mode='bilinear', align_corners=False)
         videos_resampled = videos_resampled.reshape(V, T, C, new_H, new_W).permute(1, 0, 3, 4, 2)
-        videos_resampled = videos_resampled.to(self.device)
 
         return videos_resampled
 
@@ -575,10 +600,10 @@ class PISGPipelineVelTorch:
         Returns:
         - poses: torch.Tensor of shape (N, 4, 4)
         - focals: torch.Tensor of shape (N)
-        - width: int
-        - height: int
-        - near: float
-        - far: float
+        - width: torch.Tensor of shape (N)
+        - height: torch.Tensor of shape (N)
+        - near: torch.Tensor of shape (N)
+        - far: torch.Tensor of shape (N)
         """
 
         if not cameras_paths:
@@ -592,7 +617,7 @@ class PISGPipelineVelTorch:
             valid_paths.append(_path)
 
         import numpy as np
-        camera_infos = [np.load(path) for path in cameras_paths]
+        camera_infos = [np.load(path) for path in valid_paths]
         widths = [int(info["width"]) for info in camera_infos]
         assert len(set(widths)) == 1, f"Error: Inconsistent widths found: {widths}. All cameras must have the same resolution."
         heights = [int(info["height"]) for info in camera_infos]
@@ -603,46 +628,35 @@ class PISGPipelineVelTorch:
         assert len(set(fars)) == 1, f"Error: Inconsistent fars found: {fars}. All cameras must have the same far plane."
         poses = torch.stack([torch.tensor(info["cam_transform"], device=self.device, dtype=self.dtype) for info in camera_infos])
         focals = torch.tensor([info["focal"] * widths[0] / info["aperture"] for info in camera_infos], device=self.device, dtype=self.dtype)
+        widths = torch.tensor(widths, device=self.device, dtype=torch.int32)
+        heights = torch.tensor(heights, device=self.device, dtype=torch.int32)
+        nears = torch.tensor(nears, device=self.device, dtype=self.dtype)
+        fars = torch.tensor(fars, device=self.device, dtype=self.dtype)
 
-        return poses, focals, widths[0], heights[0], nears[0], fars[0]
+        return poses, focals, widths, heights, nears, fars
 
 
-def test_pipeline(rank, gpu_size):
+def inference_pipeline(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
-    pipeline = PISGPipelineVelTorch(torch_device=device, torch_dtype=torch.float32)
+    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
 
     for _ in range(120):
         if _ % 2 == rank:
             pipeline.test(save_ckp_path="ckpt.tar", target_timestamp=_)
 
 
-def train():
-    pipeline = PISGPipelineVelTorch(torch_device=torch.device("cuda"), torch_dtype=torch.float32)
-    pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
-
-
 def export_density(rank, gpu_size):
     device = torch.device(f"cuda:{rank % gpu_size}")
     print(f"Process {rank} running on {device}")
 
-    pipeline = PISGPipelineVelTorch(torch_device=device, torch_dtype=torch.float32)
+    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
 
-    for _ in range(120):
+    import tqdm
+    for _ in tqdm.trange(120):
         if _ % 2 == rank:
-            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/den")
-
-
-def export_velocity(rank, gpu_size):
-    device = torch.device(f"cuda:{rank % gpu_size}")
-    print(f"Process {rank} running on {device}")
-
-    pipeline = PISGPipelineVelTorch(device, torch_dtype=torch.float32)
-
-    for _ in range(120):
-        if _ % 2 == rank:
-            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=64, output_dir="output/vel")
+            pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=128, output_dir="output/den")
 
 
 def run_multidevice(func):
@@ -651,11 +665,14 @@ def run_multidevice(func):
     mp.spawn(func, args=(gpu_size,), nprocs=gpu_size, join=True)
 
 
+def train(target_device):
+    pipeline = PISGPipelineTorch(torch_device=target_device, torch_dtype=torch.float32)
+    pipeline.train(batch_size=1024, save_ckp_path="ckpt.tar")
+
+
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
-    train()
-    # run_multidevice(test_pipeline)
+    train(target_device=torch.device("cuda:0"))
+    # run_multidevice(inference_pipeline)
     # run_multidevice(export_density)
-    # run_multidevice(export_velocity)
-    # run_multidevice(export_velocity)

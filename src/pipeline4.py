@@ -5,7 +5,7 @@ import os
 import math
 from pathlib import Path
 
-from model.model_hyfluid import NeRFSmall
+from model.model_hyfluid import NeRFSmall, NeRFSmallPotential
 from model.encoder_hyfluid import HashEncoderNativeFasterBackward
 
 """
@@ -23,6 +23,32 @@ Performance:
 - 1024 + 1.0 ( with mask filter ): 3721it, 62.70it/s, 100s, 37.4GB
 
 """
+
+
+def _get_minibatch_jacobian(y, x):
+    """Computes the Jacobian of y wrt x assuming minibatch-mode.
+    Args:
+      y: (N, ...) with a total of D_y elements in ...
+      x: (N, ...) with a total of D_x elements in ...
+    Returns:
+      The minibatch Jacobian matrix of shape (N, D_y, D_x)
+    """
+    assert y.shape[0] == x.shape[0]
+    y = y.view(y.shape[0], -1)
+    # Compute Jacobian row by row.
+    jac = []
+    for j in range(y.shape[1]):
+        dy_j_dx = torch.autograd.grad(
+            y[:, j],
+            x,
+            torch.ones_like(y[:, j], device=y.get_device()),
+            retain_graph=True,
+            create_graph=True,
+        )[0].view(x.shape[0], -1)
+
+        jac.append(torch.unsqueeze(dy_j_dx, 1))
+    jac = torch.cat(jac, 1)
+    return jac
 
 
 def find_relative_paths(relative_path_list):
@@ -402,11 +428,16 @@ class PISGPipelineTorch:
 
         self.encoder = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
         self.model = NeRFSmall(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2).to(self.device)
-        self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.001, betas=(0.9, 0.99))
+        self.optimizer = torch.optim.RAdam([{'params': self.model.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder.parameters(), 'eps': 1e-15}], lr=0.0005, betas=(0.9, 0.99))
+
+        self.encoder_v = HashEncoderNativeFasterBackward(device=self.device).to(self.device)
+        self.model_v = NeRFSmallPotential(num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=2, hidden_dim_color=16, input_ch=self.encoder_num_scale * 2, use_f=False).to(self.device)
+        self.optimizer_v = torch.optim.RAdam([{'params': self.model_v.parameters(), 'weight_decay': 1e-6}, {'params': self.encoder_v.parameters(), 'eps': 1e-15}], lr=0.0005, betas=(0.9, 0.99))
 
         target_lr_ratio = 0.1  # 新增：使用渐进式指数衰减，设定训练结束时的学习率为初始学习率的 10% 你可以根据需求调整目标比例
         gamma = math.exp(math.log(target_lr_ratio) / 30000)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+        self.scheduler_v = torch.optim.lr_scheduler.ExponentialLR(self.optimizer_v, gamma=gamma)
 
         def volume_render(batch_points: torch.Tensor, batch_depths: torch.Tensor, batch_time: torch.Tensor, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
             batch_points_flat = batch_points.reshape(-1, 3)  # (batch_size * depth, 3)
@@ -414,10 +445,12 @@ class PISGPipelineTorch:
             in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
             batch_points_normalized_flat = normalize_points(points=batch_points_flat, device=self.device, dtype=self.dtype)  # (batch_size * depth, 3)
             batch_input_xyzt_flat = torch.cat([batch_points_normalized_flat, batch_time.expand(batch_points_normalized_flat[..., :1].shape)], dim=-1).reshape(-1, 4)  # (batch_size * depth, 4)
-            batch_rgb_map = self.query_rgb_map_skip_ghost(batch_input_xyzt_flat=batch_input_xyzt_flat, batch_depths=batch_depths, in_all_frustum_mask=in_all_frustum_mask)
-            return batch_rgb_map
 
-        self.compiled_volume_render = torch.compile(volume_render, mode="max-autotune")
+            batch_input_xyzt_flat.requires_grad = True
+            return self.query_rgb_map_skip_ghost(batch_input_xyzt_flat=batch_input_xyzt_flat, batch_depths=batch_depths, in_all_frustum_mask=in_all_frustum_mask)
+
+        # self.compiled_volume_render = torch.compile(volume_render, mode="max-autotune")
+        self.compiled_volume_render = volume_render
 
         def query_density_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
             with torch.no_grad():
@@ -442,6 +475,33 @@ class PISGPipelineTorch:
 
         self.compiled_query_density_grid = torch.compile(query_density_grid, mode="max-autotune")
 
+        def query_velocity_grid(x_min: float, x_max: float, y_min: float, y_max: float, z_min: float, z_max: float, res: int, time: float, poses: torch.Tensor, focals: torch.Tensor, width: torch.Tensor, height: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
+            with torch.no_grad():
+                xyz = sample_points(x_min, x_max, y_min, y_max, z_min, z_max, res, device=self.device, dtype=self.dtype)
+                xyz_flat = xyz.reshape(-1, 3)
+                in_frustum_mask = is_points_in_frustum(points=xyz_flat, camera_poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+                in_all_frustum_mask = torch.all(in_frustum_mask, dim=1)
+                xyz_normalized_flat = normalize_points(points=xyz_flat, device=self.device, dtype=self.dtype)
+                input_xyzt_flat = torch.cat([xyz_normalized_flat, torch.ones_like(xyz_normalized_flat[..., :1]) * time], dim=-1).reshape(-1, 4)
+                # batchfy this
+                raw_v_flat_list, raw_f_flat_list = [], []
+                batch_size = 64 * 64 * 64
+                for i in range(0, input_xyzt_flat.shape[0], batch_size):
+                    input_xyzt_flat_batch = input_xyzt_flat[i:i + batch_size]
+                    raw_v_flat_batch, raw_f_flat_batch = self.model_v(self.encoder_v(input_xyzt_flat_batch))
+                    raw_v_flat_list.append(raw_v_flat_batch)
+                    raw_f_flat_list.append(raw_f_flat_batch)
+                raw_v_flat = torch.cat(raw_v_flat_list, dim=0)
+                raw_f_flat = torch.cat(raw_f_flat_list, dim=0)
+                in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()
+                raw_v_flat = raw_v_flat * in_all_frustum_mask_float
+                raw_f_flat = raw_f_flat * in_all_frustum_mask_float
+                raw_v = raw_v_flat.reshape(res, res, res, 3)
+                raw_f = raw_f_flat.reshape(res, res, res, 3)
+                return raw_v, raw_f
+
+        self.compiled_query_velocity_grid = torch.compile(query_velocity_grid, mode="max-autotune")
+
     def train(self, batch_size, save_ckp_path):
         videos_data = self.load_videos_data(*training_videos, ratio=self.ratio)  # (T, V, H, W, C)
         masks = get_filter_mask(video_tensor=videos_data)
@@ -451,50 +511,76 @@ class PISGPipelineTorch:
         height = height * self.ratio
 
         import tqdm
-        for _1 in tqdm.trange(0, 5):
-            losses = []  # 记录 loss
-            temp_losses = []  # 用于计算平均 loss
+        for _1 in tqdm.trange(0, 1):
+            losses_image = []  # 记录 loss_image
+            losses_nse = []  # 记录 loss_nse
+            temp_losses_image = []  # 用于计算 loss_image 的平均值
+            temp_losses_nse = []  # 用于计算 loss_nse 的平均值
 
             dirs, u, v = shuffle_uv(focals=focals, width=int(width[0].item()), height=int(height[0].item()), randomize=True, device=torch.device("cpu"), dtype=self.dtype)
             videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v).to(self.device)  # (T, V, H, W, C)
             dirs = dirs.to(self.device)
 
-            for _2, (batch_points, batch_depths, batch_indices) in enumerate(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype)):
+            for _2, (batch_points, batch_depths, batch_indices) in enumerate(tqdm.tqdm(sample_frustum_with_mask(dirs=dirs, poses=poses, mask=masks, near=near[0].item(), far=far[0].item(), depth=self.depth, batch_size=batch_size, randomize=True, device=self.device, dtype=self.dtype))):
                 batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=self.device, dtype=self.dtype)  # (batch_size, C)
-                batch_rgb_map = self.compiled_volume_render(batch_points, batch_depths, batch_time, poses, focals, width, height, near, far)
+                batch_rgb_map, loss_nse = self.compiled_volume_render(batch_points, batch_depths, batch_time, poses, focals, width, height, near, far)
                 loss_image = torch.nn.functional.mse_loss(batch_rgb_map, batch_target_pixels)
+                loss = loss_image + loss_nse
                 self.optimizer.zero_grad()
-                loss_image.backward()
+                self.optimizer_v.zero_grad()
+                loss.backward()
                 self.optimizer.step()
+                self.optimizer_v.step()
                 self.scheduler.step()
+                self.scheduler_v.step()
 
                 # 记录 loss
-                temp_losses.append(loss_image.item())
+                temp_losses_image.append(loss_image.item())
+                temp_losses_nse.append(loss_nse.item())
 
                 # 每 100 次计算平均 loss
                 if (_2 + 1) % 100 == 0:
-                    avg_loss = sum(temp_losses) / len(temp_losses)
-                    losses.append(avg_loss)
+                    avg_loss_image = sum(temp_losses_image) / len(temp_losses_image)
+                    avg_loss_nse = sum(temp_losses_nse) / len(temp_losses_nse)
+                    losses_image.append(avg_loss_image)
+                    losses_nse.append(avg_loss_nse)
                     allocated_mem = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
                     reserved_mem = torch.cuda.memory_reserved(self.device) / (1024 ** 2)  # MB
-                    tqdm.tqdm.write(f"Iteration {_2 + 1}: Avg Loss = {avg_loss:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB")
-                    temp_losses.clear()  # 清空
+                    tqdm.tqdm.write(
+                        f"Iteration {_2 + 1}: Avg Loss Image = {avg_loss_image:.6f}, Avg Loss NSE = {avg_loss_nse:.6f} | Allocated Mem: {allocated_mem:.2f} MB | Reserved Mem: {reserved_mem:.2f} MB"
+                    )
+
+                    temp_losses_image.clear()
+                    temp_losses_nse.clear()
 
             import matplotlib.pyplot as plt
 
-            # 训练结束后绘制 loss 曲线
+            # 训练结束后绘制 loss_image 曲线
             plt.figure(figsize=(10, 5))
-            plt.plot(range(100, 100 * len(losses) + 1, 100), losses, marker='o', linestyle='-')
+            plt.plot(range(100, 100 * len(losses_image) + 1, 100), losses_image, marker='o', linestyle='-', label="Loss Image")
             plt.xlabel("Iterations")
-            plt.ylabel("Average Loss")
-            plt.title(f"Training Loss Over Iterations: {_1}")
+            plt.ylabel("Loss Image")
+            plt.title(f"Training Loss Image Over Iterations: {_1}")
             plt.grid()
+            plt.legend()
+            plt.show()
+
+            # 训练结束后绘制 loss_nse 曲线
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(100, 100 * len(losses_nse) + 1, 100), losses_nse, marker='o', linestyle='-', label="Loss NSE", color="red")
+            plt.xlabel("Iterations")
+            plt.ylabel("Loss NSE")
+            plt.title(f"Training Loss NSE Over Iterations: {_1}")
+            plt.grid()
+            plt.legend()
             plt.show()
 
         if save_ckp_path is not None:
             torch.save({
                 'encoder_state_dict': self.encoder.state_dict(),
                 'model_state_dict': self.model.state_dict(),
+                'encoder_v_state_dict': self.encoder_v.state_dict(),
+                'model_v_state_dict': self.model_v.state_dict(),
             }, save_ckp_path)
 
     def test(self, save_ckp_path, target_timestamp: int, output_dir="output"):
@@ -537,8 +623,36 @@ class PISGPipelineTorch:
         den = self.compiled_query_density_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
         np.savez_compressed(f"{output_dir}/density_{target_timestamp:03d}.npz", den=den.cpu().numpy())
 
+    def export_velocity_grid(self, save_ckp_path, resolution: int, target_timestamp: int, output_dir="output"):
+        import numpy as np
+        os.makedirs(output_dir, exist_ok=True)
+
+        ckpt = torch.load(save_ckp_path)
+        self.encoder_v.load_state_dict(ckpt['encoder_v_state_dict'])
+        self.model_v.load_state_dict(ckpt['model_v_state_dict'])
+        poses, focals, width, height, near, far = self.load_cameras_data(*camera_calibrations)
+        focals = focals * self.ratio
+        width = width * self.ratio
+        height = height * self.ratio
+
+        vel, frc = self.compiled_query_velocity_grid(x_min=scene_min_current[0], x_max=scene_max_current[0], y_min=scene_min_current[1], y_max=scene_max_current[1], z_min=scene_min_current[2], z_max=scene_max_current[2], res=resolution, time=float(target_timestamp / 120.0), poses=poses, focals=focals, width=width, height=height, near=near, far=far)
+        np.savez_compressed(f"{output_dir}/velocity_{target_timestamp:03d}.npz", vel=vel.cpu().numpy(), frc=frc.cpu().numpy())
+
     def query_rgb_map_skip_ghost(self, batch_input_xyzt_flat: torch.Tensor, batch_depths: torch.Tensor, in_all_frustum_mask: torch.Tensor):
-        raw_flat = self.model(self.encoder(batch_input_xyzt_flat))  # (batch_size * depth, 4)
+        def func(x):
+            return self.model(x)
+
+        hidden = self.encoder(batch_input_xyzt_flat)
+        raw_flat = self.model(hidden)
+        jac = torch.func.vmap(torch.func.jacrev(func))(hidden)
+        jac_x = _get_minibatch_jacobian(hidden, batch_input_xyzt_flat)
+        jac = jac @ jac_x
+
+        drho_dx, drho_dy, drho_dz, drho_dt = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)]
+        raw_v_flat, raw_f_flat = self.model_v(self.encoder_v(batch_input_xyzt_flat))
+        v_x, v_y, v_z = raw_v_flat.split(1, dim=-1)
+        loss_nse = torch.mean(torch.square(drho_dt + v_x * drho_dx + v_y * drho_dy + v_z * drho_dz))
+
         in_all_frustum_mask_float = in_all_frustum_mask.unsqueeze(-1).float()  # (N,1)
         raw_flat = raw_flat * in_all_frustum_mask_float
         raw = raw_flat.reshape(-1, self.depth, 1)  # (batch_size, depth, 4)
@@ -548,7 +662,7 @@ class PISGPipelineTorch:
         alpha = 1. - torch.exp(-torch.nn.functional.relu(raw[..., -1]) * batch_dists_full)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=self.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
         batch_rgb_map = torch.sum(weights[..., None] * rgb_trained, -2)
-        return batch_rgb_map
+        return batch_rgb_map, loss_nse
 
     def load_videos_data(self, *video_paths, ratio: float):
         """
@@ -659,6 +773,18 @@ def export_density(rank, gpu_size):
             pipeline.export_density_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=128, output_dir="output/den")
 
 
+def export_velocity(rank, gpu_size):
+    device = torch.device(f"cuda:{rank % gpu_size}")
+    print(f"Process {rank} running on {device}")
+
+    pipeline = PISGPipelineTorch(torch_device=device, torch_dtype=torch.float32)
+
+    import tqdm
+    for _ in tqdm.trange(120):
+        if _ % 2 == rank:
+            pipeline.export_velocity_grid(save_ckp_path="ckpt.tar", target_timestamp=_, resolution=128, output_dir="output/vel")
+
+
 def run_multidevice(func):
     gpu_size = torch.cuda.device_count()
     print(f"Launching {gpu_size} processes for GPU tasks.")
@@ -674,5 +800,6 @@ if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
 
     train(target_device=torch.device("cuda:0"))
-    # run_multidevice(inference_pipeline)
+    run_multidevice(inference_pipeline)
     # run_multidevice(export_density)
+    # run_multidevice(export_velocity)
