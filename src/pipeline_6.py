@@ -239,7 +239,7 @@ def sample_frustum(dirs: torch.Tensor, poses: torch.Tensor, near: float, far: fl
             batch_depths[:, :-1] = midpoints + noise
 
         batch_points = batch_rays_o[:, None, :] + batch_rays_d[:, None, :] * batch_depths[:, :, None]  # (batch_size, depth, 3)
-        yield batch_points, batch_depths, batch_indices, batch_rays_d
+        yield batch_points, batch_depths, batch_indices, batch_rays_o, batch_rays_d
 
 
 def sample_random_frame(videos_data: torch.Tensor, batch_indices: torch.Tensor, device: torch.device, dtype: torch.dtype):
@@ -581,12 +581,14 @@ if __name__ == '__main__':
         videos_data_resampled = resample_frames(frames=videos_data, u=u, v=v).to(target_device)  # (T, V, H, W, C)
         dirs = dirs.to(target_device)
 
-        for _2, (batch_points, batch_depths, batch_indices, batch_rays_d) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near[0].item(), far=far[0].item(), depth=depth_size, batch_size=batch_size, randomize=True, device=target_device, dtype=target_dtype))):
+        for _2, (_x, _y, batch_indices, batch_rays_o, batch_rays_d) in enumerate(tqdm.tqdm(sample_frustum(dirs=dirs, poses=poses, near=near[0].item(), far=far[0].item(), depth=depth_size, batch_size=batch_size, randomize=True, device=target_device, dtype=target_dtype))):
             batch_time, batch_target_pixels = sample_random_frame(videos_data=videos_data_resampled, batch_indices=batch_indices, device=target_device, dtype=target_dtype)
-            POINTS_TIME_gpu = torch.cat([batch_points, batch_time.expand(batch_points[..., :1].shape)], dim=-1)
-            DISTs_gpu = batch_depths[..., 1:] - batch_depths[..., :-1].expand(batch_size, depth_size-1)
+            BATCH_RAYs_O_gpu = batch_rays_o
             BATCH_RAYs_D_gpu = batch_rays_d
             TARGET_S_gpu = batch_target_pixels
+
+            POINTS_gpu, DISTs_gpu = get_points(BATCH_RAYs_O_gpu, BATCH_RAYs_D_gpu, NEAR_float, FAR_float, depth_size, randomize=True)
+            POINTS_TIME_gpu = torch.cat([POINTS_gpu, batch_time.expand(POINTS_gpu[..., :1].shape)], dim=-1)
 
             optimizer_d.zero_grad()
             optimizer_v.zero_grad()
@@ -635,6 +637,8 @@ if __name__ == '__main__':
                 param_group['lr'] = new_lrate
 
             global_step += 1
+
+            print(f"nseloss_fine: {nseloss_fine}, img_loss: {10000 * img_loss}, proj_loss: {proj_loss}, min_vel_reg: {10.0 * min_vel_reg}, vel_loss: {vel_loss}")
 
         os.makedirs("checkpoint", exist_ok=True)
         path = os.path.join("checkpoint", 'den_{:06d}.tar'.format(ITERATION))
